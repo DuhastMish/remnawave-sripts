@@ -17,7 +17,7 @@ RESET='\033[0m'
 
 # ─── Конфиг ──────────────────────────────────────────────────
 LOG_FILE="/var/log/remnawave_diag_$(date +%Y%m%d_%H%M%S).log"
-REMNAWAVE_CONTAINER="${REMNAWAVE_CONTAINER:-remnawave-node}"
+REMNAWAVE_CONTAINER="${REMNAWAVE_CONTAINER:-remnanode}"
 REMNAWAVE_PORT="${REMNAWAVE_PORT:-2222}"
 XRAY_BINARY="/usr/local/bin/xray"
 PACKET_LOSS_THRESHOLD=5
