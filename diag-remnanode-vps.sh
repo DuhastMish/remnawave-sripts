@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 # Remnawave Node — Full Diagnostics Script
-# Version: 1.2 | Fixed
+# Version: 1.4
 # ============================================================
 
 set -uo pipefail
@@ -17,7 +17,7 @@ RESET='\033[0m'
 
 # ─── Конфиг ──────────────────────────────────────────────────
 LOG_FILE="/var/log/remnawave_diag_$(date +%Y%m%d_%H%M%S).log"
-REMNAWAVE_CONTAINER="${REMNAWAVE_CONTAINER:-remnanode}"
+REMNAWAVE_CONTAINER="${REMNAWAVE_CONTAINER:-remnawave-node}"
 REMNAWAVE_PORT="${REMNAWAVE_PORT:-2222}"
 XRAY_BINARY="/usr/local/bin/xray"
 PACKET_LOSS_THRESHOLD=5
@@ -36,6 +36,7 @@ ok()   { log "${GREEN}  ✔ $*${RESET}"; }
 warn() { log "${YELLOW}  ⚠ WARNING: $*${RESET}"; WARN=$(( WARN + 1 )); }
 crit() { log "${RED}  ✖ CRITICAL: $*${RESET}"; CRIT=$(( CRIT + 1 )); }
 info() { log "${CYAN}  ➜ $*${RESET}"; }
+fix()  { log "${YELLOW}  ℹ FIX: $*${RESET}"; }
 section() {
     log ""
     log "${BOLD}${BLUE}══════════════════════════════════════════════════${RESET}"
@@ -47,7 +48,6 @@ require_tool() {
     command -v "$1" &>/dev/null || { warn "Утилита '$1' не найдена — пропускаем блок"; return 1; }
 }
 
-# Безопасное получение числа из команды
 safe_int() {
     local val
     val=$(echo "${1:-0}" | head -1 | tr -d '[:space:]')
@@ -60,7 +60,6 @@ safe_int() {
 check_system() {
     section "1. СИСТЕМНЫЕ РЕСУРСЫ"
 
-    # Uptime
     info "Uptime: $(uptime -p 2>/dev/null || uptime)"
 
     # ── CPU ──
@@ -126,15 +125,13 @@ check_system() {
 
     # ── OOM Killer ──
     section "  OOM / KERNEL ERRORS"
-    local oom_count
-    oom_count=0
+    local oom_count=0
     if [ -f /var/log/kern.log ]; then
         oom_count=$(safe_int "$(grep -c 'Out of memory' /var/log/kern.log 2>/dev/null || echo 0)")
     elif command -v journalctl &>/dev/null; then
         oom_count=$(safe_int "$(journalctl -k --no-pager -q 2>/dev/null \
             | grep -c 'Out of memory' || echo 0)")
     fi
-
     if (( oom_count > 0 )); then
         crit "OOM Killer срабатывал $oom_count раз(а) — смотри логи ядра!"
     else
@@ -143,16 +140,14 @@ check_system() {
 }
 
 # ════════════════════════════════════════════════════════════
-# 2. СЕТЬ — ПОТЕРЯ ПАКЕТОВ
+# 2. СЕТЬ
 # ════════════════════════════════════════════════════════════
 check_network() {
     section "2. СЕТЬ"
 
-    # ── Интерфейсы ──
     info "Сетевые интерфейсы:"
     ip -brief addr show | tee -a "$LOG_FILE"
 
-    # ── Ping & packet loss ──
     if require_tool ping; then
         local loss
         loss=$(ping -c 20 -i 0.2 -W 2 "$PING_TARGET" 2>&1 \
@@ -164,81 +159,6 @@ check_network() {
         else
             ok "Потеря пакетов: ${loss}%"
         fi
-    fi
-
-    # ── MTU проверка ──
-    if require_tool ping; then
-        info "Проверка MTU (тест фрагментации)..."
-        local mtu_ok=true
-        for size in 1400 1450 1472; do
-            if ! ping -c 2 -M do -s "$size" "$PING_TARGET" &>/dev/null; then
-                warn "MTU: пакеты размером $((size+28))B не проходят без фрагментации"
-                mtu_ok=false
-                break
-            fi
-        done
-        $mtu_ok && ok "MTU 1500 — пакеты проходят нормально"
-    fi
-
-    # ── TCP BBR / буферы ──
-    section "  TCP/UDP НАСТРОЙКИ ЯДРА"
-    local cc
-    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
-    info "Алгоритм TCP CC: $cc"
-    [[ "$cc" != "bbr" ]] && warn "Рекомендуется BBR: sysctl -w net.ipv4.tcp_congestion_control=bbr"
-
-    for param in \
-        net.core.rmem_max \
-        net.core.wmem_max \
-        net.core.netdev_max_backlog \
-        net.ipv4.tcp_rmem \
-        net.ipv4.tcp_wmem \
-        net.ipv4.udp_mem \
-        net.ipv4.tcp_retries2 \
-        net.ipv4.tcp_fin_timeout; do
-        local val
-        val=$(sysctl -n "$param" 2>/dev/null || echo "N/A")
-        info "$param = $val"
-    done
-
-    # ── Dropped пакеты на интерфейсах ──
-    section "  RX/TX DROPPED ПАКЕТЫ"
-    local found_drops=false
-    while IFS= read -r iface; do
-        local rx_drop tx_drop rx_err tx_err
-        rx_drop=$(safe_int "$(cat "/sys/class/net/$iface/statistics/rx_dropped"  2>/dev/null || echo 0)")
-        tx_drop=$(safe_int "$(cat "/sys/class/net/$iface/statistics/tx_dropped"  2>/dev/null || echo 0)")
-        rx_err=$(safe_int  "$(cat "/sys/class/net/$iface/statistics/rx_errors"   2>/dev/null || echo 0)")
-        tx_err=$(safe_int  "$(cat "/sys/class/net/$iface/statistics/tx_errors"   2>/dev/null || echo 0)")
-        info "$iface → rx_drop=$rx_drop tx_drop=$tx_drop rx_err=$rx_err tx_err=$tx_err"
-        if (( rx_drop > 100 || tx_drop > 100 || rx_err > 0 || tx_err > 0 )); then
-            crit "$iface: высокое число dropped/errors!"
-            found_drops=true
-        fi
-    done < <(ls /sys/class/net/ | grep -v lo)
-    $found_drops || ok "Dropped пакеты на интерфейсах в норме"
-
-    # ── ss / conntrack ──
-    section "  СОЕДИНЕНИЯ"
-    if require_tool ss; then
-        local estab tw close_wait
-        estab=$(safe_int "$(ss -ant | grep -c ESTAB || echo 0)")
-        tw=$(safe_int     "$(ss -ant | grep -c TIME-WAIT || echo 0)")
-        close_wait=$(safe_int "$(ss -ant | grep -c CLOSE-WAIT || echo 0)")
-        info "Established: $estab | TIME-WAIT: $tw | CLOSE-WAIT: $close_wait"
-        (( tw > 5000 ))        && warn "Много TIME-WAIT соединений ($tw)"
-        (( close_wait > 500 )) && warn "Много CLOSE-WAIT соединений ($close_wait)"
-    fi
-
-    # conntrack переполнение
-    local ct_cur ct_max
-    ct_cur=$(safe_int "$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo 0)")
-    ct_max=$(safe_int "$(cat /proc/sys/net/netfilter/nf_conntrack_max   2>/dev/null || echo 0)")
-    if (( ct_max > 0 )); then
-        local ct_pct
-        ct_pct=$(awk "BEGIN{printf \"%.0f\", ($ct_cur/$ct_max)*100}")
-        info "Conntrack: $ct_cur / $ct_max (${ct_pct}%)"
-        (( ct_pct >= 80 )) && crit "Conntrack таблица заполнена на ${ct_pct}%! Пакеты будут дропаться!"
     fi
 
     # ── Routing ──
@@ -282,7 +202,6 @@ check_docker() {
 
     require_tool docker || return
 
-    # ── Статус контейнера ──
     info "Все контейнеры:"
     docker ps -a --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" | tee -a "$LOG_FILE"
 
@@ -292,29 +211,24 @@ check_docker() {
         crit "Контейнер '$REMNAWAVE_CONTAINER' НЕ запущен!"
     fi
 
-    # ── Ресурсы контейнера ──
     section "  РЕСУРСЫ КОНТЕЙНЕРОВ"
     docker stats --no-stream --format \
         "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.NetIO}}\t{{.BlockIO}}" \
         2>/dev/null | tee -a "$LOG_FILE"
 
-    # ── Рестарты ──
     section "  РЕСТАРТЫ"
     local restarts
-    restarts=$(docker inspect "$REMNAWAVE_CONTAINER" \
-               --format '{{.RestartCount}}' 2>/dev/null || echo "0")
-    restarts=$(safe_int "$restarts")
+    restarts=$(safe_int "$(docker inspect "$REMNAWAVE_CONTAINER" \
+               --format '{{.RestartCount}}' 2>/dev/null || echo 0)")
     info "Количество рестартов '$REMNAWAVE_CONTAINER': $restarts"
     if (( restarts > 5 )); then
         crit "Контейнер перезапускался $restarts раз!"
     fi
 
-    # ── Последние логи ──
     section "  ЛОГИ КОНТЕЙНЕРА (последние 80 строк)"
     docker logs --tail=80 --timestamps "$REMNAWAVE_CONTAINER" 2>&1 \
         | tee -a "$LOG_FILE" || warn "Не удалось получить логи контейнера"
 
-    # ── Ошибки в логах ──
     section "  ОШИБКИ В ЛОГАХ"
     local err_count
     err_count=$(safe_int "$(docker logs --tail=500 "$REMNAWAVE_CONTAINER" 2>&1 \
@@ -323,7 +237,6 @@ check_docker() {
     info "Найдено строк с ошибками (last 500): $err_count"
     (( err_count > 20 )) && crit "Много ошибок в логах контейнера: $err_count"
 
-    # ── Сеть Docker ──
     section "  DOCKER NETWORK"
     local net_id
     net_id=$(docker inspect "$REMNAWAVE_CONTAINER" \
@@ -350,7 +263,6 @@ check_xray() {
         warn "xray binary не найден — проверьте путь"
     fi
 
-    # Конфиг — валидация
     local cfg_path
     cfg_path=$(docker inspect "$REMNAWAVE_CONTAINER" \
                --format '{{range .Mounts}}{{if eq .Destination "/etc/xray"}}{{.Source}}{{end}}{{end}}' \
@@ -474,12 +386,382 @@ check_latency() {
 }
 
 # ════════════════════════════════════════════════════════════
-# 10. ИТОГОВЫЙ ОТЧЁТ
+# 10. ПРОВЕРКА ТИПИЧНЫХ ПРИЧИН ПОТЕРИ ПАКЕТОВ
+# ════════════════════════════════════════════════════════════
+check_packet_loss_reasons() {
+    section "10. ПРОВЕРКА ПРИЧИН ПОТЕРИ ПАКЕТОВ"
+
+    # ────────────────────────────────────────────────────────
+    # 10.1 CONNTRACK
+    # ────────────────────────────────────────────────────────
+    log ""
+    log "${BOLD}  [10.1] Conntrack (таблица соединений)${RESET}"
+
+    local ct_cur ct_max ct_pct
+    ct_cur=$(safe_int "$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo 0)")
+    ct_max=$(safe_int "$(cat /proc/sys/net/netfilter/nf_conntrack_max   2>/dev/null || echo 0)")
+
+    if (( ct_max == 0 )); then
+        warn "Conntrack модуль не загружен или недоступен"
+    else
+        ct_pct=$(awk "BEGIN{printf \"%.0f\", ($ct_cur/$ct_max)*100}")
+        info "Текущее количество соединений: $ct_cur"
+        info "Максимум соединений (max):     $ct_max"
+        info "Заполнено:                     ${ct_pct}%"
+
+        if (( ct_pct >= 90 )); then
+            crit "Conntrack ПЕРЕПОЛНЕН на ${ct_pct}% — новые пакеты ДРОПАЮТСЯ прямо сейчас!"
+            fix "Нужно увеличить: sysctl -w net.netfilter.nf_conntrack_max=524288"
+        elif (( ct_pct >= 70 )); then
+            warn "Conntrack заполнен на ${ct_pct}% — приближается к лимиту"
+            fix "Рекомендуется увеличить nf_conntrack_max до 524288"
+        else
+            ok "Conntrack в норме: ${ct_cur}/${ct_max} (${ct_pct}%)"
+        fi
+
+        # Проверка таймаутов — слишком большие значения держат старые соединения
+        local tcp_est_timeout
+        tcp_est_timeout=$(safe_int "$(sysctl -n net.netfilter.nf_conntrack_tcp_timeout_established 2>/dev/null || echo 0)")
+        info "Таймаут established соединений: ${tcp_est_timeout}s"
+        if (( tcp_est_timeout > 3600 )); then
+            warn "Таймаут established слишком большой (${tcp_est_timeout}s) — старые соединения занимают место"
+            fix "Рекомендуется: sysctl -w net.netfilter.nf_conntrack_tcp_timeout_established=600"
+        else
+            ok "Таймаут established соединений в норме: ${tcp_est_timeout}s"
+        fi
+    fi
+
+    # ────────────────────────────────────────────────────────
+    # 10.2 MTU
+    # ────────────────────────────────────────────────────────
+    log ""
+    log "${BOLD}  [10.2] MTU (максимальный размер пакета)${RESET}"
+
+    # Показываем MTU всех интерфейсов
+    info "MTU всех сетевых интерфейсов:"
+    while IFS= read -r iface; do
+        local mtu
+        mtu=$(safe_int "$(cat "/sys/class/net/$iface/mtu" 2>/dev/null || echo 0)")
+        info "  $iface → MTU = $mtu"
+        if [[ "$iface" =~ ^(tun|wg|vp|ppp) ]]; then
+            if (( mtu > 1450 )); then
+                warn "VPN-интерфейс $iface имеет MTU=$mtu — может вызывать фрагментацию пакетов"
+                fix "Рекомендуется установить MTU 1400-1450: ip link set dev $iface mtu 1400"
+            else
+                ok "VPN-интерфейс $iface MTU=$mtu — в допустимом диапазоне"
+            fi
+        fi
+    done < <(ls /sys/class/net/ | grep -v lo)
+
+    # Практический тест — пингуем с разными размерами пакетов
+    info "Практический тест MTU (пинг без фрагментации):"
+    local mtu_max_ok=0
+    for size in 1200 1300 1350 1400 1420 1450 1472; do
+        if ping -c 2 -W 2 -M do -s "$size" "$PING_TARGET" &>/dev/null; then
+            mtu_max_ok=$size
+        else
+            info "  Размер $((size+28))B (payload=${size}B) — НЕ проходит"
+            break
+        fi
+        info "  Размер $((size+28))B (payload=${size}B) — OK"
+    done
+
+    if (( mtu_max_ok > 0 )); then
+        info "Максимальный рабочий MTU: $((mtu_max_ok+28))B"
+        if (( mtu_max_ok < 1400 )); then
+            crit "MTU очень низкий — максимум $((mtu_max_ok+28))B. Высокая вероятность проблем с пакетами!"
+        elif (( mtu_max_ok < 1450 )); then
+            warn "MTU ограничен до $((mtu_max_ok+28))B — пакеты крупнее будут фрагментироваться"
+        else
+            ok "MTU в норме — пакеты до $((mtu_max_ok+28))B проходят свободно"
+        fi
+    fi
+
+    # ────────────────────────────────────────────────────────
+    # 10.3 TCP BBR + fq qdisc
+    # ────────────────────────────────────────────────────────
+    log ""
+    log "${BOLD}  [10.3] TCP Congestion Control + очередь пакетов${RESET}"
+
+    local cc
+    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
+    info "Текущий алгоритм управления перегрузкой TCP: $cc"
+
+    if [[ "$cc" == "bbr" ]]; then
+        ok "TCP BBR включён — оптимально для VPN"
+    else
+        warn "Используется '$cc' вместо BBR — при потерях пакетов скорость упадёт сильнее"
+        fix "Команда для включения BBR: sysctl -w net.ipv4.tcp_congestion_control=bbr"
+
+        # Проверяем доступен ли BBR вообще
+        if sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -q bbr; then
+            info "BBR доступен в системе, но не активирован"
+        else
+            warn "BBR может быть недоступен — ядро старше 4.9 или модуль не загружен"
+        fi
+    fi
+
+    # Проверка qdisc
+    local qdisc_info
+    if require_tool tc; then
+        info "Текущая дисциплина очереди пакетов (qdisc):"
+        tc qdisc show 2>/dev/null | tee -a "$LOG_FILE" || true
+
+        local default_qdisc
+        default_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "unknown")
+        info "Default qdisc: $default_qdisc"
+
+        if [[ "$default_qdisc" == "fq" || "$default_qdisc" == "fq_codel" ]]; then
+            ok "Qdisc '$default_qdisc' — подходит для работы с BBR"
+        else
+            warn "Qdisc '$default_qdisc' — рекомендуется 'fq' вместе с BBR"
+            fix "Команда: sysctl -w net.core.default_qdisc=fq"
+        fi
+    fi
+
+    # ────────────────────────────────────────────────────────
+    # 10.4 RX/TX БУФЕРЫ
+    # ────────────────────────────────────────────────────────
+    log ""
+    log "${BOLD}  [10.4] Сетевые буферы RX/TX${RESET}"
+
+    # Минимальные рекомендуемые значения
+    local rmem_max wmem_max
+    rmem_max=$(safe_int "$(sysctl -n net.core.rmem_max 2>/dev/null || echo 0)")
+    wmem_max=$(safe_int "$(sysctl -n net.core.wmem_max 2>/dev/null || echo 0)")
+
+    info "net.core.rmem_max (буфер приёма):  $rmem_max байт ($(( rmem_max / 1024 / 1024 ))MB)"
+    info "net.core.wmem_max (буфер отправки): $wmem_max байт ($(( wmem_max / 1024 / 1024 ))MB)"
+
+    # rmem_max
+    if (( rmem_max < 16777216 )); then
+        crit "Буфер приёма (rmem_max) слишком мал: $rmem_max байт — пакеты будут теряться при высокой нагрузке"
+        fix "Рекомендуется: sysctl -w net.core.rmem_max=134217728"
+    elif (( rmem_max < 67108864 )); then
+        warn "Буфер приёма (rmem_max) небольшой: $rmem_max байт"
+        fix "Рекомендуется увеличить до 134217728"
+    else
+        ok "Буфер приёма rmem_max в норме: $rmem_max байт"
+    fi
+
+    # wmem_max
+    if (( wmem_max < 16777216 )); then
+        crit "Буфер отправки (wmem_max) слишком мал: $wmem_max байт — пакеты будут теряться при высокой нагрузке"
+        fix "Рекомендуется: sysctl -w net.core.wmem_max=134217728"
+    elif (( wmem_max < 67108864 )); then
+        warn "Буфер отправки (wmem_max) небольшой: $wmem_max байт"
+        fix "Рекомендуется увеличить до 134217728"
+    else
+        ok "Буфер отправки wmem_max в норме: $wmem_max байт"
+    fi
+
+    # Дополнительные буферные параметры
+    local backlog netdev_backlog
+    backlog=$(safe_int     "$(sysctl -n net.core.somaxconn         2>/dev/null || echo 0)")
+    netdev_backlog=$(safe_int "$(sysctl -n net.core.netdev_max_backlog 2>/dev/null || echo 0)")
+
+    info "net.core.somaxconn (очередь TCP):          $backlog"
+    info "net.core.netdev_max_backlog (очередь NIC): $netdev_backlog"
+
+    (( backlog < 1024 )) && warn "somaxconn=$backlog мал — увеличь до 65535" \
+                         || ok "somaxconn=$backlog в норме"
+    (( netdev_backlog < 5000 )) && warn "netdev_max_backlog=$netdev_backlog мал — увеличь до 50000" \
+                                || ok "netdev_max_backlog=$netdev_backlog в норме"
+
+    # Dropped пакеты на интерфейсах
+    log ""
+    log "${BOLD}  Dropped пакеты на сетевых интерфейсах:${RESET}"
+    local found_drops=false
+    while IFS= read -r iface; do
+        local rx_drop tx_drop rx_err tx_err
+        rx_drop=$(safe_int "$(cat "/sys/class/net/$iface/statistics/rx_dropped"  2>/dev/null || echo 0)")
+        tx_drop=$(safe_int "$(cat "/sys/class/net/$iface/statistics/tx_dropped"  2>/dev/null || echo 0)")
+        rx_err=$(safe_int  "$(cat "/sys/class/net/$iface/statistics/rx_errors"   2>/dev/null || echo 0)")
+        tx_err=$(safe_int  "$(cat "/sys/class/net/$iface/statistics/tx_errors"   2>/dev/null || echo 0)")
+        info "$iface → rx_drop=$rx_drop  tx_drop=$tx_drop  rx_err=$rx_err  tx_err=$tx_err"
+        if (( rx_drop > 100 || tx_drop > 100 || rx_err > 0 || tx_err > 0 )); then
+            crit "$iface: обнаружены потери пакетов на уровне сетевого интерфейса!"
+            fix "Возможные причины: буферы малы, перегрузка NIC, неверный MTU"
+            found_drops=true
+        fi
+    done < <(ls /sys/class/net/ | grep -v lo)
+    $found_drops || ok "Dropped пакеты на интерфейсах в норме"
+
+    # ────────────────────────────────────────────────────────
+    # 10.5 КОНТЕЙНЕР — СТАБИЛЬНОСТЬ
+    # ────────────────────────────────────────────────────────
+    log ""
+    log "${BOLD}  [10.5] Стабильность контейнера${RESET}"
+
+    require_tool docker || return
+
+    # Статус
+    local container_status
+    container_status=$(docker inspect "$REMNAWAVE_CONTAINER" \
+        --format '{{.State.Status}}' 2>/dev/null || echo "not_found")
+    info "Статус контейнера: $container_status"
+
+    if [[ "$container_status" != "running" ]]; then
+        crit "Контейнер не запущен! Статус: $container_status"
+    fi
+
+    # Рестарты
+    local restarts
+    restarts=$(safe_int "$(docker inspect "$REMNAWAVE_CONTAINER" \
+        --format '{{.RestartCount}}' 2>/dev/null || echo 0)")
+    info "Количество рестартов: $restarts"
+    if (( restarts > 10 )); then
+        crit "Контейнер перезапускался $restarts раз — явная нестабильность!"
+        fix "Смотри логи: docker logs --tail=100 $REMNAWAVE_CONTAINER"
+    elif (( restarts > 3 )); then
+        warn "Контейнер перезапускался $restarts раз"
+    else
+        ok "Количество рестартов в норме: $restarts"
+    fi
+
+    # Restart policy
+    local restart_policy
+    restart_policy=$(docker inspect "$REMNAWAVE_CONTAINER" \
+        --format '{{.HostConfig.RestartPolicy.Name}}' 2>/dev/null || echo "unknown")
+    info "Политика перезапуска (restart policy): $restart_policy"
+    if [[ "$restart_policy" == "no" || "$restart_policy" == "" ]]; then
+        warn "Restart policy = '$restart_policy' — контейнер не поднимется автоматически после падения!"
+        fix "Рекомендуется: docker update --restart=unless-stopped $REMNAWAVE_CONTAINER"
+    else
+        ok "Restart policy: $restart_policy"
+    fi
+
+    # Время последнего старта
+    local started_at
+    started_at=$(docker inspect "$REMNAWAVE_CONTAINER" \
+        --format '{{.State.StartedAt}}' 2>/dev/null || echo "unknown")
+    info "Последний запуск контейнера: $started_at"
+
+    # OOM Kill внутри контейнера
+    local oom_killed
+    oom_killed=$(docker inspect "$REMNAWAVE_CONTAINER" \
+        --format '{{.State.OOMKilled}}' 2>/dev/null || echo "false")
+    if [[ "$oom_killed" == "true" ]]; then
+        crit "Контейнер был убит OOM Killer — не хватает памяти!"
+        fix "Увеличь лимит памяти контейнера или добавь Swap на сервер"
+    else
+        ok "OOM Kill контейнера: не зафиксирован"
+    fi
+
+    # Ошибки в логах контейнера
+    local err_count timeout_count refused_count
+    err_count=$(safe_int "$(docker logs --tail=500 "$REMNAWAVE_CONTAINER" 2>&1 \
+        | grep -ciE 'error|fatal|panic' || echo 0)")
+    timeout_count=$(safe_int "$(docker logs --tail=500 "$REMNAWAVE_CONTAINER" 2>&1 \
+        | grep -ciE 'timeout|timed out' || echo 0)")
+    refused_count=$(safe_int "$(docker logs --tail=500 "$REMNAWAVE_CONTAINER" 2>&1 \
+        | grep -ciE 'refused|reset by peer|broken pipe|EOF' || echo 0)")
+
+    info "Ошибок в логах (error/fatal/panic): $err_count"
+    info "Таймаутов в логах:                  $timeout_count"
+    info "Обрывов соединений в логах:         $refused_count"
+
+    (( err_count > 20 ))     && crit "Много критических ошибок в логах: $err_count" \
+                              || ok "Критических ошибок в логах: $err_count"
+    (( timeout_count > 10 )) && warn "Много таймаутов в логах: $timeout_count" \
+                              || ok "Таймаутов в логах: $timeout_count"
+    (( refused_count > 10 )) && warn "Много обрывов соединений в логах: $refused_count" \
+                              || ok "Обрывов соединений в логах: $refused_count"
+
+    # ────────────────────────────────────────────────────────
+    # 10.6 FIREWALL — БЛОКИРОВКИ
+    # ────────────────────────────────────────────────────────
+    log ""
+    log "${BOLD}  [10.6] Firewall — блокировки трафика${RESET}"
+
+    # iptables — считаем DROP/REJECT правила с ненулевыми счётчиками пакетов
+    if require_tool iptables; then
+        local drop_rules_with_hits
+        drop_rules_with_hits=$(iptables -L INPUT -nv 2>/dev/null \
+            | awk '$1+0 > 0 && /DROP|REJECT/ {print}' || true)
+
+        if [[ -n "$drop_rules_with_hits" ]]; then
+            crit "Найдены активные DROP/REJECT правила с реальными срабатываниями:"
+            echo "$drop_rules_with_hits" | while IFS= read -r rule; do
+                log "${RED}    $rule${RESET}"
+            done
+            fix "Эти правила реально блокируют пакеты — проверь не попадает ли под них VPN-трафик"
+        else
+            ok "DROP/REJECT правил с реальными срабатываниями не обнаружено"
+        fi
+
+        # Проверяем конкретно порт ноды
+        if iptables -L INPUT -nv 2>/dev/null | grep -qE "DROP|REJECT"; then
+            # Ищем явные разрешения для порта ноды
+            if iptables -L INPUT -nv 2>/dev/null | grep -q "$REMNAWAVE_PORT"; then
+                ok "Порт $REMNAWAVE_PORT явно упомянут в правилах iptables"
+            else
+                warn "Порт $REMNAWAVE_PORT не найден в правилах iptables — может блокироваться по умолчанию"
+                fix "Проверь: iptables -L INPUT -nv | grep $REMNAWAVE_PORT"
+            fi
+        fi
+
+        # Политика по умолчанию для INPUT
+        local input_policy
+        input_policy=$(iptables -L INPUT 2>/dev/null | head -1 | grep -oP 'policy \K\w+' || echo "unknown")
+        info "Политика INPUT по умолчанию: $input_policy"
+        if [[ "$input_policy" == "DROP" ]]; then
+            warn "Политика INPUT = DROP — весь трафик без явного разрешения блокируется"
+            fix "Убедись что порт $REMNAWAVE_PORT разрешён: iptables -I INPUT -p tcp --dport $REMNAWAVE_PORT -j ACCEPT"
+        else
+            ok "Политика INPUT = $input_policy — трафик не блокируется по умолчанию"
+        fi
+
+        # FORWARD цепочка (важна для Docker)
+        local forward_policy
+        forward_policy=$(iptables -L FORWARD 2>/dev/null | head -1 | grep -oP 'policy \K\w+' || echo "unknown")
+        info "Политика FORWARD по умолчанию: $forward_policy"
+        if [[ "$forward_policy" == "DROP" ]]; then
+            warn "Политика FORWARD = DROP — может блокировать трафик Docker-контейнеров!"
+            fix "Docker требует: iptables -P FORWARD ACCEPT"
+        else
+            ok "Политика FORWARD = $forward_policy — Docker-трафик не блокируется"
+        fi
+    fi
+
+    # nftables
+    if command -v nft &>/dev/null; then
+        local nft_drops
+        nft_drops=$(nft list ruleset 2>/dev/null | grep -ciE 'drop|reject' || echo 0)
+        nft_drops=$(safe_int "$nft_drops")
+        info "Правил drop/reject в nftables: $nft_drops"
+        if (( nft_drops > 0 )); then
+            warn "В nftables есть $nft_drops drop/reject правил — проверь вручную: nft list ruleset"
+        else
+            ok "Drop/reject правил в nftables не обнаружено"
+        fi
+    fi
+
+    # UFW
+    if command -v ufw &>/dev/null; then
+        local ufw_status
+        ufw_status=$(ufw status 2>/dev/null | head -1 | awk '{print $2}' || echo "unknown")
+        info "UFW статус: $ufw_status"
+        if [[ "$ufw_status" == "active" ]]; then
+            if ufw status 2>/dev/null | grep -qE "ALLOW.*$REMNAWAVE_PORT|$REMNAWAVE_PORT.*ALLOW"; then
+                ok "UFW активен и порт $REMNAWAVE_PORT разрешён"
+            else
+                crit "UFW активен, но порт $REMNAWAVE_PORT НЕ найден в разрешённых!"
+                fix "Добавь правило: ufw allow $REMNAWAVE_PORT/tcp && ufw allow $REMNAWAVE_PORT/udp"
+            fi
+        else
+            ok "UFW неактивен — не блокирует трафик"
+        fi
+    fi
+}
+
+# ════════════════════════════════════════════════════════════
+# 11. ИТОГОВЫЙ ОТЧЁТ
 # ════════════════════════════════════════════════════════════
 print_summary() {
     log ""
     log "${BOLD}${BLUE}╔══════════════════════════════════════════════════╗${RESET}"
-    log "${BOLD}${BLUE}║           ИТОГИ ДИАГНОСТИКИ                      ║${RESET}"
+    log "${BOLD}${BLUE}║              ИТОГИ ДИАГНОСТИКИ                   ║${RESET}"
     log "${BOLD}${BLUE}╚══════════════════════════════════════════════════╝${RESET}"
     log ""
 
@@ -493,27 +775,14 @@ print_summary() {
     log ""
     log "  📄 Полный отчёт сохранён: ${BOLD}$LOG_FILE${RESET}"
     log ""
-
-    if (( CRIT > 0 )); then
-        log "${BOLD}${CYAN}  ЧАСТЫЕ ПРИЧИНЫ ПОТЕРИ ПАКЕТОВ (checklist):${RESET}"
-        log "  • Conntrack переполнен → увеличить nf_conntrack_max"
-        log "  • MTU mismatch → установить MTU 1400-1450 на интерфейсе VPN"
-        log "  • TCP CC не BBR → включить BBR + fq qdisc"
-        log "  • RX/TX buffers малы → увеличить rmem_max / wmem_max"
-        log "  • Контейнер падает → проверить логи и restart policy"
-        log "  • Firewall DROP → проверить iptables/nftables"
-        log ""
-    fi
 }
 
 # ════════════════════════════════════════════════════════════
 # MAIN
 # ════════════════════════════════════════════════════════════
 main() {
-    # Создаём лог-файл
     touch "$LOG_FILE" 2>/dev/null || LOG_FILE="/tmp/remnawave_diag_$(date +%Y%m%d_%H%M%S).log"
 
-    # Ловушка на ошибки — не падаем, просто сообщаем
     trap 'log "${YELLOW}  ⚠ Нефатальная ошибка на строке $LINENO (команда: $BASH_COMMAND) — продолжаем...${RESET}"' ERR
 
     log "${BOLD}${BLUE}"
@@ -523,7 +792,7 @@ main() {
     log "  ██╔══██╗██╔══╝  ██║╚██╔╝██║██║╚██╗██║██╔══██║"
     log "  ██║  ██║███████╗██║ ╚═╝ ██║██║ ╚████║██║  ██║"
     log "  ╚═╝  ╚═╝╚══════╝╚═╝     ╚═╝╚═╝  ╚═══╝╚═╝  ╚═╝"
-    log "  NODE DIAGNOSTICS v1.2 — $(date)"
+    log "  NODE DIAGNOSTICS v1.4 — $(date)"
     log "${RESET}"
 
     check_system
@@ -535,6 +804,7 @@ main() {
     check_tls
     check_system_logs
     check_latency
+    check_packet_loss_reasons
     print_summary
 }
 
