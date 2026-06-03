@@ -309,12 +309,16 @@ check_tls() {
 
     require_tool openssl || return
 
-    local cert_dirs=("/etc/ssl" "/etc/letsencrypt/live" "/opt/remnawave" "/var/lib/remnawave")
+    # ── Сертификаты на диске ──────────────────────────────
+    local cert_dirs=("/etc/letsencrypt/live" "/opt/remnawave" "/var/lib/remnawave")
     local found_cert=false
 
     for dir in "${cert_dirs[@]}"; do
         if [ ! -d "$dir" ]; then continue; fi
         while IFS= read -r cert; do
+            [[ "$cert" == *"ca-certificates"* ]] && continue
+            [[ "$cert" == *"ca-bundle"* ]]       && continue
+
             local expiry days_left
             expiry=$(openssl x509 -enddate -noout -in "$cert" 2>/dev/null | cut -d= -f2 || echo "")
             if [[ -n "$expiry" ]]; then
@@ -332,13 +336,92 @@ check_tls() {
         done < <(find "$dir" -name "*.crt" -o -name "fullchain.pem" 2>/dev/null)
     done
 
-    $found_cert || info "Сертификаты в стандартных путях не найдены"
+    $found_cert || info "Сертификаты на диске не найдены"
 
-    if ss -tlnup | grep -q ":443"; then
-        info "Тест TLS handshake на localhost:443..."
-        echo | timeout 5 openssl s_client -connect "127.0.0.1:443" -brief 2>&1 \
-            | head -5 | tee -a "$LOG_FILE" || warn "TLS handshake не удался"
+    # ── TLS handshake на всех *443 портах ─────────────────
+    log ""
+    log "${BOLD}  Поиск и проверка всех портов *443...${RESET}"
+
+    # Собираем все слушающие порты содержащие "443" (443, 8443, 4443 и т.д.)
+    local tls_ports=()
+    while IFS= read -r port; do
+        tls_ports+=("$port")
+    done < <(ss -tlnp 2>/dev/null \
+        | awk 'NR>1 {print $4}' \
+        | grep -oP '(?<=:)\d+$' \
+        | grep '443' \
+        | sort -u)
+
+    if (( ${#tls_ports[@]} == 0 )); then
+        info "Портов содержащих '443' не обнаружено — TLS тест пропущен"
+        return
     fi
+
+    info "Найдены порты: ${tls_ports[*]}"
+    log ""
+
+    for port in "${tls_ports[@]}"; do
+        log "${BOLD}  Проверка порта $port...${RESET}"
+
+        # Получаем информацию о сертификате через TLS handshake
+        local tls_output
+        tls_output=$(echo | timeout 5 openssl s_client \
+            -connect "127.0.0.1:${port}" \
+            -servername "localhost" \
+            2>&1 || true)
+
+        # Проверяем факт установки соединения
+        if echo "$tls_output" | grep -q "CONNECTED"; then
+            ok "Порт $port — TLS соединение установлено"
+
+            # Извлекаем данные сертификата
+            local cert_subject cert_issuer cert_expiry cert_days
+            cert_subject=$(echo "$tls_output" | grep "subject=" | head -1 | sed 's/subject=//' | xargs)
+            cert_issuer=$(echo  "$tls_output" | grep "issuer="  | head -1 | sed 's/issuer=//'  | xargs)
+            cert_expiry=$(echo "$tls_output" \
+                | openssl x509 -noout -enddate 2>/dev/null \
+                | cut -d= -f2 || echo "")
+
+            [[ -n "$cert_subject" ]] && info "  Субъект:  $cert_subject"
+            [[ -n "$cert_issuer"  ]] && info "  Издатель: $cert_issuer"
+
+            if [[ -n "$cert_expiry" ]]; then
+                cert_days=$(( ( $(date -d "$cert_expiry" +%s 2>/dev/null || echo 0) - $(date +%s) ) / 86400 ))
+                info "  Истекает: $cert_expiry (через $cert_days дней)"
+                if (( cert_days < 14 )); then
+                    crit "Порт $port: сертификат истекает через $cert_days дней!"
+                elif (( cert_days < 30 )); then
+                    warn "Порт $port: сертификат истекает через $cert_days дней"
+                else
+                    ok "Порт $port: сертификат действителен ещё $cert_days дней"
+                fi
+            fi
+
+            # Проверяем протоколы — предупреждаем об устаревших
+            if echo "$tls_output" | grep -q "Protocol  : TLSv1$\|Protocol  : TLSv1.1"; then
+                warn "Порт $port: используется устаревший TLS 1.0/1.1 — рекомендуется TLS 1.2+"
+            fi
+
+            local tls_proto
+            tls_proto=$(echo "$tls_output" | grep -oP 'Protocol\s+:\s+\K\S+' | head -1 || echo "unknown")
+            [[ -n "$tls_proto" ]] && info "  Протокол: $tls_proto"
+
+        elif echo "$tls_output" | grep -qE "Connection refused|errno=111"; then
+            info "Порт $port — соединение отклонено (порт закрыт или не TLS)"
+        elif echo "$tls_output" | grep -qE "handshake failure|ssl handshake"; then
+            warn "Порт $port — TLS handshake провалился (неверная конфигурация SSL)"
+        elif echo "$tls_output" | grep -qE "timeout|timed out"; then
+            warn "Порт $port — таймаут соединения"
+        else
+            warn "Порт $port — неизвестная ошибка TLS"
+            # Показываем первые строки вывода для диагностики
+            echo "$tls_output" | head -5 | while IFS= read -r line; do
+                info "  $line"
+            done
+        fi
+
+        log ""
+    done
 }
 
 # ════════════════════════════════════════════════════════════
