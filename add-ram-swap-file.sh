@@ -48,13 +48,31 @@ echo
 echo "Создаю swap-файл размером ${SWAP_SIZE}GB..."
 
 # Создание файла (fallocate с fallback на dd)
+CREATE_OK=0
+
 if command -v fallocate >/dev/null 2>&1; then
-    if ! fallocate -l "${SWAP_SIZE}G" "$SWAPFILE"; then
-        echo "fallocate не сработал, использую dd..."
-        dd if=/dev/zero of="$SWAPFILE" bs=1M count=$((SWAP_SIZE * 1024)) status=progress
+    FALLOCATE_ERR=$(fallocate -l "${SWAP_SIZE}G" "$SWAPFILE" 2>&1)
+    if [ $? -eq 0 ]; then
+        CREATE_OK=1
+    elif echo "$FALLOCATE_ERR" | grep -qi "No space left on device"; then
+        echo "Ошибка: на диске недостаточно места для файла размером ${SWAP_SIZE}GB."
+        echo "Доступное место:"
+        df -h "$(dirname "$SWAPFILE")"
+        rm -f "$SWAPFILE"
+        exit 1
+    else
+        echo "fallocate не сработал ($FALLOCATE_ERR), пробую dd..."
     fi
-else
-    dd if=/dev/zero of="$SWAPFILE" bs=1M count=$((SWAP_SIZE * 1024)) status=progress
+fi
+
+if [ "$CREATE_OK" -ne 1 ]; then
+    if ! dd if=/dev/zero of="$SWAPFILE" bs=1M count=$((SWAP_SIZE * 1024)) status=progress; then
+        echo "Ошибка: не удалось создать swap-файл (вероятно, не хватает места на диске)."
+        echo "Доступное место:"
+        df -h "$(dirname "$SWAPFILE")"
+        rm -f "$SWAPFILE"
+        exit 1
+    fi
 fi
 
 # Права доступа
