@@ -51,8 +51,7 @@ echo "Создаю swap-файл размером ${SWAP_SIZE}GB..."
 CREATE_OK=0
 
 if command -v fallocate >/dev/null 2>&1; then
-    FALLOCATE_ERR=$(fallocate -l "${SWAP_SIZE}G" "$SWAPFILE" 2>&1)
-    if [ $? -eq 0 ]; then
+    if FALLOCATE_ERR=$(fallocate -l "${SWAP_SIZE}G" "$SWAPFILE" 2>&1); then
         CREATE_OK=1
     elif echo "$FALLOCATE_ERR" | grep -qi "No space left on device"; then
         echo "Ошибка: на диске недостаточно места для файла размером ${SWAP_SIZE}GB."
