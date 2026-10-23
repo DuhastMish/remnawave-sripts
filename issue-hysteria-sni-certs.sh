@@ -16,7 +16,7 @@ SECRETS_DIR="/etc/letsencrypt/secrets"
 CF_CREDS_FILE="${SECRETS_DIR}/cloudflare.ini"
 LE_EMAIL_FILE="${SECRETS_DIR}/le-email"
 XRAY_SSL_DIR="/etc/xray/ssl"
-REMNAWAVE_DIR="/opt/remnawave"
+REMNAWAVE_DIR="/opt/remnanode"
 SELFSTEAL_URL="https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh"
 CF_API="https://api.cloudflare.com/client/v4"
 
