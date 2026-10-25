@@ -19,6 +19,8 @@ XRAY_SSL_DIR="/etc/xray/ssl"
 REMNAWAVE_DIR="/opt/remnanode"
 REMNANODE_LOG_DIR="/var/log/remnanode"
 LOGROTATE_CONF="/etc/logrotate.d/remnanode"
+XRAY_SHARE_DIR="/usr/local/share/xray"
+GEO_FILES=(geo-zapret.dat ip-zapret.dat)
 SELFSTEAL_URL="https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh"
 CF_API="https://api.cloudflare.com/client/v4"
 
@@ -180,26 +182,28 @@ restart_remnawave() {
     (cd "$REMNAWAVE_DIR" && docker compose down && docker compose up -d)
 }
 
-# ─── Logrotate ────────────────────────────────────────────────────────────────
-# Добавляет volume с логами в сервис remnanode, если его там нет
-add_log_volume() {
+# ─── Volumes в docker-compose ноды ────────────────────────────────────────────
+# Добавляет volume (например /a:/a:ro) в сервис remnanode, если путь ещё не смонтирован.
+# Возвращает 0, только если файл изменён (нужен перезапуск ноды)
+add_compose_volume() {
+    local mapping="$1" host_path="${1%%:*}"
     local compose="${REMNAWAVE_DIR}/docker-compose.yml" backup rc=0
 
     if [[ ! -f "$compose" ]]; then
-        log_warn "$compose не найден, пропускаю добавление volume для логов"
-        return
+        log_warn "$compose не найден, пропускаю добавление volume ${host_path}"
+        return 1
     fi
-    if grep -Eq "^[[:space:]]*-[[:space:]]*['\"]?${REMNANODE_LOG_DIR}:" "$compose"; then
-        log_info "Volume ${REMNANODE_LOG_DIR} уже указан в $compose"
-        return
+    if grep -Eq "^[[:space:]]*-[[:space:]]*['\"]?${host_path}:" "$compose"; then
+        log_info "Volume ${host_path} уже указан в $compose"
+        return 1
     fi
 
-    backup="${compose}.bak.$(date +%Y%m%d%H%M%S)"
-    cp "$compose" "$backup"
-    log_info "Добавляю volume ${REMNANODE_LOG_DIR} в $compose (бэкап: $backup)..."
+    backup=$(mktemp "${compose}.bak.$(date +%Y%m%d%H%M%S).XXXX")
+    cp -p "$compose" "$backup"
+    log_info "Добавляю volume ${mapping} в $compose (бэкап: $backup)..."
 
     # Ищем services → remnanode; дописываем элемент в его volumes или создаём volumes в конце сервиса
-    awk -v vol="'${REMNANODE_LOG_DIR}:${REMNANODE_LOG_DIR}'" '
+    awk -v vol="'${mapping}'" '
         function pad(n,   s) { s = ""; while (n-- > 0) s = s " "; return s }
         {
             ind = ($0 ~ /^[[:space:]]*(#.*)?$/) ? -1 : match($0, /[^ ]/) - 1
@@ -238,17 +242,31 @@ add_log_volume() {
     if [[ "$rc" -ne 0 ]]; then
         mv "$backup" "$compose"
         case "$rc" in
-            2) log_warn "volumes сервиса remnanode в inline-формате, добавьте вручную: - ${REMNANODE_LOG_DIR}:${REMNANODE_LOG_DIR}" ;;
-            3) log_warn "Сервис remnanode не найден в $compose, добавьте volume вручную" ;;
+            2) log_warn "volumes сервиса remnanode в inline-формате, добавьте вручную: - ${mapping}" ;;
+            3) log_warn "Сервис remnanode не найден в $compose, добавьте вручную: - ${mapping}" ;;
             *) log_warn "docker-compose.yml после изменения невалиден, файл восстановлен из бэкапа" ;;
         esac
-        return
+        return 1
     fi
 
-    log_info "Volume добавлен"
-    restart_remnawave
+    log_info "Volume ${mapping} добавлен"
 }
 
+# ─── Geo-файлы ────────────────────────────────────────────────────────────────
+# Монтирует geo-файлы в ноду
+setup_geo_files() {
+    local name changed=0
+
+    for name in "${GEO_FILES[@]}"; do
+        add_compose_volume "./${name}:${XRAY_SHARE_DIR}/${name}" && changed=1
+    done
+
+    if [[ "$changed" == 1 ]]; then
+        restart_remnawave
+    fi
+}
+
+# ─── Logrotate ────────────────────────────────────────────────────────────────
 setup_logrotate() {
     log_info "Создание $REMNANODE_LOG_DIR..."
     mkdir -p "$REMNANODE_LOG_DIR"
@@ -272,7 +290,9 @@ ${REMNANODE_LOG_DIR}/*.log {
 EOF
     chmod 644 "$LOGROTATE_CONF"
 
-    add_log_volume
+    if add_compose_volume "${REMNANODE_LOG_DIR}:${REMNANODE_LOG_DIR}"; then
+        restart_remnawave
+    fi
 
     log_info "Проверка конфигурации logrotate..."
     logrotate -vf "$LOGROTATE_CONF" || log_error "logrotate завершился с ошибкой"
@@ -305,6 +325,7 @@ run_issue() {
     update_dns
     issue_cert
     install_selfsteal
+    add_compose_volume "${XRAY_SSL_DIR}:${XRAY_SSL_DIR}:ro" || true
     restart_remnawave
 
     echo
@@ -327,16 +348,18 @@ run_auth() {
 # ─── Меню ─────────────────────────────────────────────────────────────────────
 while true; do
     echo
-    echo "1) Выпустить сертификат для домена (DNS + certbot + selfsteal + перезапуск)"
+    echo "1) Выпустить сертификат для домена (DNS + certbot + selfsteal + volume + перезапуск)"
     echo "2) Указать Cloudflare авторизацию (email + API Token)"
     echo "3) Настроить logrotate для remnanode"
+    echo "4) Подключить geo-файлы (geo-zapret.dat, ip-zapret.dat) к ноде"
     echo "0) Выход"
-    read -rp "Выберите действие [0-3]: " choice
+    read -rp "Выберите действие [0-4]: " choice
 
     case "$choice" in
         1) run_issue ;;
         2) run_auth ;;
         3) setup_logrotate ;;
+        4) setup_geo_files ;;
         0) exit 0 ;;
         *) log_warn "Неверный выбор" ;;
     esac
