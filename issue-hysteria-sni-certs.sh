@@ -17,6 +17,8 @@ CF_CREDS_FILE="${SECRETS_DIR}/cloudflare.ini"
 LE_EMAIL_FILE="${SECRETS_DIR}/le-email"
 XRAY_SSL_DIR="/etc/xray/ssl"
 REMNAWAVE_DIR="/opt/remnanode"
+REMNANODE_LOG_DIR="/var/log/remnanode"
+LOGROTATE_CONF="/etc/logrotate.d/remnanode"
 SELFSTEAL_URL="https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh"
 CF_API="https://api.cloudflare.com/client/v4"
 
@@ -178,6 +180,106 @@ restart_remnawave() {
     (cd "$REMNAWAVE_DIR" && docker compose down && docker compose up -d)
 }
 
+# ─── Logrotate ────────────────────────────────────────────────────────────────
+# Добавляет volume с логами в сервис remnanode, если его там нет
+add_log_volume() {
+    local compose="${REMNAWAVE_DIR}/docker-compose.yml" backup rc=0
+
+    if [[ ! -f "$compose" ]]; then
+        log_warn "$compose не найден, пропускаю добавление volume для логов"
+        return
+    fi
+    if grep -Eq "^[[:space:]]*-[[:space:]]*['\"]?${REMNANODE_LOG_DIR}:" "$compose"; then
+        log_info "Volume ${REMNANODE_LOG_DIR} уже указан в $compose"
+        return
+    fi
+
+    backup="${compose}.bak.$(date +%Y%m%d%H%M%S)"
+    cp "$compose" "$backup"
+    log_info "Добавляю volume ${REMNANODE_LOG_DIR} в $compose (бэкап: $backup)..."
+
+    # Ищем services → remnanode; дописываем элемент в его volumes или создаём volumes в конце сервиса
+    awk -v vol="'${REMNANODE_LOG_DIR}:${REMNANODE_LOG_DIR}'" '
+        function pad(n,   s) { s = ""; while (n-- > 0) s = s " "; return s }
+        {
+            ind = ($0 ~ /^[[:space:]]*(#.*)?$/) ? -1 : match($0, /[^ ]/) - 1
+            if (ind == 0) top = $1
+
+            if (state == "svc" && ind >= 0 && ind <= svc_ind) {
+                print pad(key_ind) "volumes:"; print pad(key_ind + 2) "- " vol; state = "done"
+            }
+            if (state == "vols" && ind >= 0) {
+                item_ind = ($0 ~ /^[[:space:]]*- /) ? ind : key_ind + 2
+                print pad(item_ind) "- " vol; state = "done"
+            }
+            print
+
+            if (state == "" && top == "services:" && ind > 0 && $0 ~ /^[[:space:]]+remnanode:[[:space:]]*$/) {
+                state = "svc"; svc_ind = ind; key_ind = -1; next
+            }
+            if (state == "svc" && ind > svc_ind) {
+                if (key_ind < 0) key_ind = ind
+                if (ind == key_ind && $0 ~ /^[[:space:]]*volumes:/) {
+                    if ($0 !~ /^[[:space:]]*volumes:[[:space:]]*(#.*)?$/) exit 2
+                    state = "vols"
+                }
+            }
+        }
+        END {
+            if (state == "svc")  { print pad(key_ind) "volumes:"; print pad(key_ind + 2) "- " vol }
+            if (state == "vols") { print pad(key_ind + 2) "- " vol }
+            if (state == "")     exit 3
+        }
+    ' "$backup" > "$compose" || rc=$?
+
+    if [[ "$rc" -eq 0 ]] && ! (cd "$REMNAWAVE_DIR" && docker compose config -q); then
+        rc=1
+    fi
+    if [[ "$rc" -ne 0 ]]; then
+        mv "$backup" "$compose"
+        case "$rc" in
+            2) log_warn "volumes сервиса remnanode в inline-формате, добавьте вручную: - ${REMNANODE_LOG_DIR}:${REMNANODE_LOG_DIR}" ;;
+            3) log_warn "Сервис remnanode не найден в $compose, добавьте volume вручную" ;;
+            *) log_warn "docker-compose.yml после изменения невалиден, файл восстановлен из бэкапа" ;;
+        esac
+        return
+    fi
+
+    log_info "Volume добавлен"
+    restart_remnawave
+}
+
+setup_logrotate() {
+    log_info "Создание $REMNANODE_LOG_DIR..."
+    mkdir -p "$REMNANODE_LOG_DIR"
+
+    if ! command -v logrotate >/dev/null; then
+        log_info "Установка logrotate..."
+        apt update -q
+        apt install -y -q logrotate
+    fi
+
+    log_info "Создание конфигурации $LOGROTATE_CONF..."
+    cat > "$LOGROTATE_CONF" << EOF
+${REMNANODE_LOG_DIR}/*.log {
+    size 50M
+    rotate 5
+    compress
+    missingok
+    notifempty
+    copytruncate
+}
+EOF
+    chmod 644 "$LOGROTATE_CONF"
+
+    add_log_volume
+
+    log_info "Проверка конфигурации logrotate..."
+    logrotate -vf "$LOGROTATE_CONF" || log_error "logrotate завершился с ошибкой"
+
+    log_info "Logrotate для remnanode настроен"
+}
+
 # ─── Сценарии ─────────────────────────────────────────────────────────────────
 run_issue() {
     read -rp "Введите домен (например sni.example.com): " DOMAIN
@@ -227,12 +329,14 @@ while true; do
     echo
     echo "1) Выпустить сертификат для домена (DNS + certbot + selfsteal + перезапуск)"
     echo "2) Указать Cloudflare авторизацию (email + API Token)"
+    echo "3) Настроить logrotate для remnanode"
     echo "0) Выход"
-    read -rp "Выберите действие [0-2]: " choice
+    read -rp "Выберите действие [0-3]: " choice
 
     case "$choice" in
         1) run_issue ;;
         2) run_auth ;;
+        3) setup_logrotate ;;
         0) exit 0 ;;
         *) log_warn "Неверный выбор" ;;
     esac
