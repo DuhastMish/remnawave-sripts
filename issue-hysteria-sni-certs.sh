@@ -21,8 +21,16 @@ REMNANODE_LOG_DIR="/var/log/remnanode"
 LOGROTATE_CONF="/etc/logrotate.d/remnanode"
 XRAY_SHARE_DIR="/usr/local/share/xray"
 GEO_FILES=(geo-zapret.dat ip-zapret.dat)
+NODE_PORT=2222
 SELFSTEAL_URL="https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh"
 CF_API="https://api.cloudflare.com/client/v4"
+DOCKER_INSTALL_URL="https://get.docker.com"
+TRAFFIC_GUARD_INSTALL_URL="https://raw.githubusercontent.com/dotX12/traffic-guard/master/install.sh"
+TRAFFIC_GUARD_LISTS=(
+    "https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/refs/heads/main/public/government_networks.list"
+    "https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/refs/heads/main/public/antiscanner.list"
+)
+UFW_OPEN_PORTS=(443/tcp 443/udp 4443/tcp 8443/tcp)
 
 # ─── Проверка root ────────────────────────────────────────────────────────────
 [[ "$EUID" -ne 0 ]] && log_error "Скрипт должен запускаться от root"
@@ -300,6 +308,130 @@ EOF
     log_info "Logrotate для remnanode настроен"
 }
 
+# ─── Traffic-guard + UFW ──────────────────────────────────────────────────────
+setup_firewall() {
+    local ssh_ports port panel_ip url tg_args=() i
+
+    if ! command -v ufw >/dev/null; then
+        log_info "Установка ufw..."
+        apt update -q
+        apt install -y -q ufw
+    fi
+
+    # SSH открываем первым, чтобы не потерять доступ к серверу
+    ssh_ports=$(sshd -T 2>/dev/null | awk '$1 == "port" { print $2 }' || true)
+    for port in $(printf '%s\n' 22 $ssh_ports | sort -un); do
+        log_info "UFW: открываю ${port}/tcp (SSH)"
+        ufw allow "${port}/tcp" comment 'SSH' >/dev/null
+    done
+
+    if ! command -v traffic-guard >/dev/null; then
+        log_info "Установка traffic-guard..."
+        curl -fsSL "$TRAFFIC_GUARD_INSTALL_URL" | bash
+    fi
+
+    for url in "${TRAFFIC_GUARD_LISTS[@]}"; do
+        tg_args+=(-u "$url")
+    done
+    log_info "Применение списков traffic-guard..."
+    traffic-guard full "${tg_args[@]}" || log_error "traffic-guard завершился с ошибкой"
+
+    for port in "${UFW_OPEN_PORTS[@]}"; do
+        log_info "UFW: открываю ${port}"
+        ufw allow "$port" >/dev/null
+    done
+
+    # Порт ноды нужен панели; без него после включения ufw нода станет offline
+    read -rp "IP панели для доступа к порту ${NODE_PORT} (пусто — открыть для всех): " panel_ip
+    if [[ -n "$panel_ip" ]]; then
+        [[ "$panel_ip" =~ ^[0-9a-fA-F.:/]+$ ]] || log_error "Некорректный IP: $panel_ip"
+        log_info "UFW: открываю ${NODE_PORT}/tcp только для $panel_ip"
+        ufw allow from "$panel_ip" to any port "$NODE_PORT" proto tcp comment 'remnanode' >/dev/null
+    else
+        log_warn "UFW: открываю ${NODE_PORT}/tcp для всех"
+        ufw allow "${NODE_PORT}/tcp" comment 'remnanode' >/dev/null
+    fi
+
+    if ! ufw status | grep -q '^Status: active'; then
+        log_info "Включение ufw..."
+        ufw --force enable
+    fi
+
+    ufw status verbose
+    log_info "Traffic-guard и UFW настроены"
+}
+
+# ─── Установка ноды ───────────────────────────────────────────────────────────
+# Принимает SECRET_KEY как есть, с префиксом SECRET_KEY= и/или в кавычках
+read_secret_key() {
+    # -e (readline): длинный токен не обрезается лимитом терминала в 4096 символов
+    read -erp "Вставьте SECRET_KEY ноды из панели: " SECRET_KEY
+    SECRET_KEY=$(printf '%s' "$SECRET_KEY" | tr -d '[:space:]')
+    SECRET_KEY="${SECRET_KEY#SECRET_KEY=}"
+    SECRET_KEY="${SECRET_KEY//\"/}"
+    SECRET_KEY="${SECRET_KEY//\'/}"
+
+    [[ -z "$SECRET_KEY" ]] && log_error "SECRET_KEY не может быть пустым"
+    [[ "$SECRET_KEY" =~ ^eyJ[A-Za-z0-9+/=_-]+$ ]] || log_error "SECRET_KEY имеет неверный формат"
+    if command -v python3 >/dev/null && ! python3 -c '
+import base64, json, sys
+s = sys.argv[1]
+json.loads(base64.b64decode(s + "=" * (-len(s) % 4)))
+' "$SECRET_KEY" 2>/dev/null; then
+        log_error "SECRET_KEY не декодируется — вероятно, скопирован не полностью"
+    fi
+}
+
+install_remnanode() {
+    local compose="${REMNAWAVE_DIR}/docker-compose.yml" backup
+
+    read_secret_key
+
+    if ! command -v docker >/dev/null; then
+        log_info "Установка Docker..."
+        curl -fsSL "$DOCKER_INSTALL_URL" | sh
+    fi
+
+    mkdir -p "$REMNAWAVE_DIR"
+
+    if [[ -f "$compose" ]]; then
+        # Не перезаписываем файл целиком, чтобы сохранить добавленные volumes
+        grep -q 'SECRET_KEY=' "$compose" || log_error "В $compose нет SECRET_KEY, обновите его вручную"
+        backup=$(mktemp "${compose}.bak.$(date +%Y%m%d%H%M%S).XXXX")
+        cp -p "$compose" "$backup"
+        log_info "$compose уже существует, обновляю только SECRET_KEY (бэкап: $backup)..."
+        sed -i -E "s|^([[:space:]]*-[[:space:]]*)SECRET_KEY=.*|\1SECRET_KEY=\"${SECRET_KEY}\"|" "$compose"
+    else
+        log_info "Создание $compose..."
+        cat > "$compose" << EOF
+services:
+  remnanode:
+    container_name: remnanode
+    hostname: remnanode
+    image: remnawave/node:latest
+    network_mode: host
+    restart: always
+    cap_add:
+      - NET_ADMIN
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    environment:
+      - NODE_PORT=${NODE_PORT}
+      - SECRET_KEY="${SECRET_KEY}"
+EOF
+    fi
+    chmod 600 "$compose"
+
+    log_info "Запуск remnanode..."
+    (cd "$REMNAWAVE_DIR" && docker compose up -d)
+    sleep 5
+    (cd "$REMNAWAVE_DIR" && docker compose logs -t --tail 30)
+
+    log_info "Нода запущена. Логи в реальном времени: cd ${REMNAWAVE_DIR} && docker compose logs -f -t"
+}
+
 # ─── Сценарии ─────────────────────────────────────────────────────────────────
 run_issue() {
     read -rp "Введите домен (например sni.example.com): " DOMAIN
@@ -348,18 +480,23 @@ run_auth() {
 # ─── Меню ─────────────────────────────────────────────────────────────────────
 while true; do
     echo
-    echo "1) Выпустить сертификат для домена (DNS + certbot + selfsteal + volume + перезапуск)"
-    echo "2) Указать Cloudflare авторизацию (email + API Token)"
+    echo "1) Установить remnanode (Docker + docker-compose.yml + запуск)"
+    echo "2) Выпустить сертификат для домена (DNS + certbot + selfsteal + volume + перезапуск)"
     echo "3) Настроить logrotate для remnanode"
     echo "4) Подключить geo-файлы (geo-zapret.dat, ip-zapret.dat) к ноде"
+    echo "5) Спрятать от сканеров и открыть порты (traffic-guard + ufw)"
+    echo
+    echo "9) Указать Cloudflare авторизацию (email + API Token)"
     echo "0) Выход"
-    read -rp "Выберите действие [0-4]: " choice
+    read -rp "Выберите действие [0-5, 9]: " choice
 
     case "$choice" in
-        1) run_issue ;;
-        2) run_auth ;;
+        1) install_remnanode ;;
+        2) run_issue ;;
         3) setup_logrotate ;;
         4) setup_geo_files ;;
+        5) setup_firewall ;;
+        9) run_auth ;;
         0) exit 0 ;;
         *) log_warn "Неверный выбор" ;;
     esac
