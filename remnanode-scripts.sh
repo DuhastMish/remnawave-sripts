@@ -361,6 +361,77 @@ setup_firewall() {
     log_info "Traffic-guard и UFW настроены"
 }
 
+# ─── Очистка диска ────────────────────────────────────────────────────────────
+show_disk_usage() {
+    local dir
+    for dir in / /var /var/log; do
+        log_info "Крупнейшие директории в $dir:"
+        du -h -x --max-depth=1 "$dir" 2>/dev/null | sort -rh | head -20
+    done
+}
+
+cleanup_disk() {
+    local before after answer f snapname revision
+
+    before=$(df -k --output=avail / | tail -1)
+    df -h /
+    show_disk_usage
+
+    log_info "Очистка журналов systemd..."
+    journalctl --disk-usage
+    journalctl --vacuum-size=200M || log_warn "journalctl --vacuum-size завершился с ошибкой"
+    journalctl --vacuum-time=3d   || log_warn "journalctl --vacuum-time завершился с ошибкой"
+
+    log_info "Очистка кэша apt и неиспользуемых пакетов..."
+    apt clean
+    apt autoremove --purge -y || log_warn "apt autoremove завершился с ошибкой"
+
+    if command -v docker >/dev/null; then
+        docker system df
+        # Удаляет и volumes остановленных контейнеров — данные в них пропадут
+        read -rp "Удалить ВСЕ неиспользуемые Docker-образы, контейнеры, сети и volumes? [y/N]: " answer
+        if [[ "$answer" =~ ^[Yy]$ ]]; then
+            docker system prune -a --volumes -f || log_warn "docker system prune завершился с ошибкой"
+        else
+            log_info "Пропускаю очистку Docker"
+        fi
+    fi
+
+    if ! command -v logrotate >/dev/null; then
+        log_info "Установка logrotate..."
+        apt update -q
+        apt install -y -q logrotate
+    fi
+    log_info "Принудительная ротация логов..."
+    # logrotate.conf подключает logrotate.d/ вместе с глобальными настройками (su и т.п.)
+    logrotate -vf /etc/logrotate.conf || log_warn "logrotate завершился с ошибкой"
+
+    if command -v snap >/dev/null; then
+        log_info "Удаление старых ревизий snap..."
+        snap list --all | awk '/disabled/{print $1, $3}' | while read -r snapname revision; do
+            snap remove "$snapname" --revision="$revision" || log_warn "Не удалось удалить $snapname ($revision)"
+        done
+    fi
+
+    log_info "Очистка системных логов..."
+    for f in /var/log/syslog /var/log/kern.log; do
+        if [[ -f "$f" ]]; then
+            truncate -s 0 "$f"
+        fi
+    done
+    rm -f /var/log/syslog.*.gz /var/log/kern.log.*.gz /var/log/auth.log.*.gz
+
+    if [[ -d "$REMNANODE_LOG_DIR" ]]; then
+        log_info "Удаление логов remnanode старше 7 дней..."
+        find "$REMNANODE_LOG_DIR" -type f -mtime +7 -exec ls -lh {} \;
+        find "$REMNANODE_LOG_DIR" -type f -mtime +7 -delete
+    fi
+
+    after=$(df -k --output=avail / | tail -1)
+    df -h /
+    log_info "Очистка завершена, освобождено: $(( (after - before) / 1024 )) MB"
+}
+
 # ─── Установка ноды ───────────────────────────────────────────────────────────
 # Принимает SECRET_KEY как есть, с префиксом SECRET_KEY= и/или в кавычках
 read_secret_key() {
@@ -485,10 +556,11 @@ while true; do
     echo "3) Настроить logrotate для remnanode"
     echo "4) Подключить geo-файлы (geo-zapret.dat, ip-zapret.dat) к ноде"
     echo "5) Спрятать от сканеров и открыть порты (traffic-guard + ufw)"
+    echo "6) Очистить диск (журналы, apt, docker, логи)"
     echo
     echo "9) Указать Cloudflare авторизацию (email + API Token)"
     echo "0) Выход"
-    read -rp "Выберите действие [0-5, 9]: " choice
+    read -rp "Выберите действие [0-6, 9]: " choice
 
     case "$choice" in
         1) install_remnanode ;;
@@ -496,6 +568,7 @@ while true; do
         3) setup_logrotate ;;
         4) setup_geo_files ;;
         5) setup_firewall ;;
+        6) cleanup_disk ;;
         9) run_auth ;;
         0) exit 0 ;;
         *) log_warn "Неверный выбор" ;;
