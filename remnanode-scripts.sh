@@ -31,6 +31,12 @@ TRAFFIC_GUARD_LISTS=(
     "https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/refs/heads/main/public/antiscanner.list"
 )
 UFW_OPEN_PORTS=(443/tcp 443/udp 4443/tcp 8443/tcp)
+NGINX_CONF="/etc/nginx/nginx.conf"
+CASCADE_STREAM_CONF="/etc/nginx/cascade-stream.conf"
+CASCADE_EXITS_FILE="/etc/nginx/cascade-exits.list"
+CASCADE_ENTRY_FILE="/etc/nginx/cascade-entry.domain"
+CASCADE_DEFAULT_PORTS="443 8443"
+CASCADE_CONNECT_TIMEOUT="4s"
 
 # ─── Проверка root ────────────────────────────────────────────────────────────
 [[ "$EUID" -ne 0 ]] && log_error "Скрипт должен запускаться от root"
@@ -106,6 +112,26 @@ detect_ip() {
     done
 }
 
+ensure_server_ip() {
+    SERVER_IP=$(detect_ip)
+    if [[ -z "$SERVER_IP" ]]; then
+        read -rp "Не удалось определить IP. Введите IP сервера: " SERVER_IP
+        [[ -z "$SERVER_IP" ]] && log_error "IP не может быть пустым"
+    fi
+    log_info "IP сервера: $SERVER_IP"
+}
+
+ensure_cf_creds() {
+    load_creds
+    if [[ -z "$CF_API_TOKEN" || -z "$LE_EMAIL" ]]; then
+        log_warn "Cloudflare credentials не найдены, введите их"
+        ask_creds 0
+    else
+        verify_token
+        log_info "Используются сохранённые credentials ($LE_EMAIL)"
+    fi
+}
+
 # ─── DNS: A-запись на текущий VPS ─────────────────────────────────────────────
 update_dns() {
     local candidate="$DOMAIN" zone_id="" records id
@@ -120,10 +146,17 @@ update_dns() {
     [[ "$candidate" == "$DOMAIN" ]] && log_error "$DOMAIN — корневой домен зоны. Скрипт работает только с поддоменами"
     log_info "Зона Cloudflare: $candidate"
 
-    # Удаляем старые A (и мешающие CNAME) записи — только с точным именем поддомена
+    # Старые A/AAAA (и мешающие CNAME) записи — только с точным именем поддомена.
+    # Иначе имя резолвится сразу в несколько адресов, включая старый сервер
     records=$(cf_api GET "/zones/${zone_id}/dns_records?name=${DOMAIN}&per_page=100" \
         | jq -r --arg name "$DOMAIN" \
-            '.result[] | select(.name == $name and (.type == "A" or .type == "CNAME")) | "\(.id) \(.type) \(.content)"')
+            '.result[] | select(.name == $name and (.type == "A" or .type == "AAAA" or .type == "CNAME")) | "\(.id) \(.type) \(.content)"')
+
+    if [[ "$records" =~ ^[^[:space:]]+\ A\ ${SERVER_IP//./\\.}$ ]]; then
+        log_info "A $DOMAIN → $SERVER_IP уже указана, других записей нет"
+        return
+    fi
+
     while read -r id type content; do
         [[ -z "$id" ]] && continue
         log_warn "Удаляю $type $DOMAIN → $content"
@@ -309,8 +342,9 @@ EOF
 }
 
 # ─── Traffic-guard + UFW ──────────────────────────────────────────────────────
-setup_firewall() {
-    local ssh_ports port panel_ip url tg_args=() i
+# Ставит ufw и открывает SSH (22 и фактический порт sshd), чтобы не потерять доступ
+ufw_allow_ssh() {
+    local ssh_ports port
 
     if ! command -v ufw >/dev/null; then
         log_info "Установка ufw..."
@@ -318,12 +352,17 @@ setup_firewall() {
         apt install -y -q ufw
     fi
 
-    # SSH открываем первым, чтобы не потерять доступ к серверу
     ssh_ports=$(sshd -T 2>/dev/null | awk '$1 == "port" { print $2 }' || true)
     for port in $(printf '%s\n' 22 $ssh_ports | sort -un); do
         log_info "UFW: открываю ${port}/tcp (SSH)"
         ufw allow "${port}/tcp" comment 'SSH' >/dev/null
     done
+}
+
+setup_firewall() {
+    local port panel_ip url tg_args=() i
+
+    ufw_allow_ssh
 
     if ! command -v traffic-guard >/dev/null; then
         log_info "Установка traffic-guard..."
@@ -503,27 +542,245 @@ EOF
     log_info "Нода запущена. Логи в реальном времени: cd ${REMNAWAVE_DIR} && docker compose logs -f -t"
 }
 
+# ─── Каскад: РФ-вход (nginx stream + ssl_preread) ─────────────────────────────
+# Читает домены выходов: каждый домен — это SNI выхода и A-запись на его IP
+read_cascade_exits() {
+    local saved="" input d
+    [[ -f "$CASCADE_ENTRY_FILE" ]] && saved=$(cat "$CASCADE_ENTRY_FILE")
+
+    # На этот домен ссылаются хосты в панели; при переезде входа меняется только его A-запись
+    read -rp "Домен входа (например ru-1.example.com)${saved:+ [$saved]}: " input
+    CASCADE_ENTRY=$(echo "${input:-$saved}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+    [[ "$CASCADE_ENTRY" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]] \
+        || log_error "Некорректный домен входа: ${CASCADE_ENTRY:-пусто}"
+
+    saved=""
+    [[ -f "$CASCADE_EXITS_FILE" ]] && saved=$(tr '\n' ' ' < "$CASCADE_EXITS_FILE" | sed 's/ *$//')
+
+    echo "Домены выходов через запятую или пробел (например kraw-pl-1.example.com,kraw-pl-2.example.com)"
+    read -rp "Выходы${saved:+ [$saved]}: " input
+    input="${input:-$saved}"
+    [[ -z "$input" ]] && log_error "Список выходов не может быть пустым"
+
+    CASCADE_EXITS=()
+    for d in $(echo "$input" | tr ',;' '  ' | tr '[:upper:]' '[:lower:]' | tr ' ' '\n' | awk 'NF && !seen[$0]++'); do
+        [[ "$d" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]] \
+            || log_error "Некорректный домен: $d"
+        [[ "$d" == "$CASCADE_ENTRY" ]] && log_error "$d — домен самого входа, его нельзя указывать среди выходов (петля)"
+        CASCADE_EXITS+=("$d")
+    done
+
+    read -rp "Порты для пересылки [$CASCADE_DEFAULT_PORTS]: " input
+    CASCADE_PORTS=()
+    for d in $(echo "${input:-$CASCADE_DEFAULT_PORTS}" | tr ',;' '  '); do
+        [[ "$d" =~ ^[0-9]+$ && "$d" -ge 1 && "$d" -le 65535 ]] || log_error "Некорректный порт: $d"
+        CASCADE_PORTS+=("$d")
+    done
+}
+
+# Порт должен быть свободен или занят самим nginx (повторный запуск)
+check_cascade_ports() {
+    local port users
+    for port in "${CASCADE_PORTS[@]}"; do
+        users=$(ss -Hltnp "sport = :${port}" 2>/dev/null | grep -o 'users:(("[^"]*"' | cut -d'"' -f2 | sort -u | tr '\n' ' ')
+        if [[ -n "$users" && "$users" != "nginx " ]]; then
+            log_error "Порт ${port}/tcp занят: ${users}. Вход каскада нельзя ставить рядом с сервисом на этом порту (например, xray ноды)"
+        fi
+    done
+}
+
+# Системный DNS (обычно 127.0.0.53); публичные резолверы из РФ могут быть недоступны
+cascade_resolvers() {
+    local ns
+    ns=$(awk '$1 == "nameserver" && $2 ~ /^[0-9.]+$/ { print $2 }' /etc/resolv.conf 2>/dev/null | tr '\n' ' ')
+    echo "${ns:-1.1.1.1 8.8.8.8}"
+}
+
+write_cascade_conf() {
+    local port d resolvers
+    resolvers=$(cascade_resolvers)
+
+    {
+        echo "# Сгенерировано remnanode-scripts.sh (каскад). Ручные правки будут перезаписаны"
+        echo "stream {"
+        echo "    resolver ${resolvers}valid=30s ipv6=off;"
+        echo "    resolver_timeout 3s;"
+        echo
+        echo "    log_format cascade '\$remote_addr [\$time_local] port=\$server_port sni=\$ssl_preread_server_name '"
+        echo "                       'up=\$upstream_addr st=\$status in=\$bytes_received out=\$bytes_sent t=\$session_time';"
+        echo "    access_log /var/log/nginx/cascade.log cascade buffer=64k flush=5s;"
+        for port in "${CASCADE_PORTS[@]}"; do
+            echo
+            echo "    map \$ssl_preread_server_name \$cascade_exit_${port} {"
+            for d in "${CASCADE_EXITS[@]}"; do
+                echo "        ${d} ${d}:${port};"
+            done
+            echo "        default 127.0.0.1:9;    # неизвестный SNI: соединение сбрасывается"
+            echo "    }"
+            echo
+            echo "    server {"
+            echo "        listen ${port} reuseport;"
+            echo "        ssl_preread on;"
+            echo "        proxy_pass \$cascade_exit_${port};"
+            echo "        proxy_connect_timeout ${CASCADE_CONNECT_TIMEOUT};"
+            echo "        proxy_next_upstream on;    # нода группы не отвечает — пробуем следующую A-запись"
+            echo "        proxy_timeout 30m;"
+            echo "        proxy_socket_keepalive on;"
+            echo "    }"
+        done
+        echo "}"
+    } > "$CASCADE_STREAM_CONF"
+}
+
+# Подключает stream-конфиг в nginx.conf и поднимает лимиты соединений
+patch_nginx_conf() {
+    if ! grep -q "include ${CASCADE_STREAM_CONF};" "$NGINX_CONF"; then
+        printf '\ninclude %s;\n' "$CASCADE_STREAM_CONF" >> "$NGINX_CONF"
+    fi
+    if ! grep -Eq '^[[:space:]]*worker_rlimit_nofile' "$NGINX_CONF"; then
+        sed -i -E '0,/^[[:space:]]*worker_processes/s//worker_rlimit_nofile 65535;\n&/' "$NGINX_CONF"
+    fi
+    sed -i -E 's/^([[:space:]]*worker_connections)[[:space:]]+[0-9]+;/\1 8192;/' "$NGINX_CONF"
+}
+
+# Печатает subject сертификата, если TLS-рукопожатие с этим SNI прошло
+tls_subject() {
+    timeout 8 openssl s_client -connect "$1" -servername "$2" </dev/null 2>/dev/null \
+        | openssl x509 -noout -subject 2>/dev/null || true
+}
+
+check_cascade_exits() {
+    local d port ip subject ips
+    log_info "Проверка рукопожатия через вход (127.0.0.1)..."
+    for d in "${CASCADE_EXITS[@]}"; do
+        for port in "${CASCADE_PORTS[@]}"; do
+            subject=$(tls_subject "127.0.0.1:${port}" "$d")
+            if [[ -n "$subject" ]]; then
+                echo -e "  ${GREEN}OK${NC}    $d:$port  ($subject)"
+            else
+                echo -e "  ${RED}FAIL${NC}  $d:$port  — нет ответа (DNS, файрвол выхода, порт $port на выходе)"
+            fi
+        done
+
+        # Группа нод одного профиля: вход чередует их по кругу, поэтому проверяем каждую
+        read -ra ips <<< "${CASCADE_EXIT_IPS[$d]}"
+        (( ${#ips[@]} > 1 )) || continue
+        for ip in "${ips[@]}"; do
+            subject=$(tls_subject "${ip}:${CASCADE_PORTS[0]}" "$d")
+            if [[ -n "$subject" ]]; then
+                echo -e "        ${GREEN}OK${NC}    нода $ip"
+            else
+                echo -e "        ${RED}FAIL${NC}  нода $ip — недоступна, вход будет переключаться с неё на другие с задержкой ${CASCADE_CONNECT_TIMEOUT}"
+            fi
+        done
+    done
+}
+
+# Резолвит выходы; несколько A-записей у одного имени — группа нод одного профиля
+resolve_cascade_exits() {
+    local d ips ip local_ips
+    local_ips=" ${SERVER_IP} $(hostname -I 2>/dev/null) "
+
+    declare -gA CASCADE_EXIT_IPS=()
+    for d in "${CASCADE_EXITS[@]}"; do
+        ips=$(getent ahostsv4 "$d" | awk '!seen[$1]++ { print $1 }' | tr '\n' ' ' | sed 's/ *$//')
+        CASCADE_EXIT_IPS[$d]="$ips"
+        if [[ -z "$ips" ]]; then
+            log_warn "$d не резолвится — путь через него работать не будет, пока нет A-записи"
+            continue
+        fi
+        for ip in $ips; do
+            [[ "$local_ips" == *" $ip "* ]] \
+                && log_error "$d указывает на этот сервер ($ip) — получится петля. Имя выхода должно указывать на выход, не на вход"
+        done
+        if [[ "$ips" == *" "* ]]; then
+            log_info "$d → $ips (группа нод, DNS-балансировка по кругу)"
+        else
+            log_info "$d → $ips"
+        fi
+    done
+}
+
+setup_cascade() {
+    local conf_backup="" main_backup port
+
+    read_cascade_exits
+    check_cascade_ports
+
+    if ! command -v nginx >/dev/null || ! dpkg -s libnginx-mod-stream >/dev/null 2>&1; then
+        log_info "Установка nginx и модуля stream..."
+        apt update -q
+        apt install -y -q nginx libnginx-mod-stream
+    fi
+    nginx -V 2>&1 | grep -q ssl_preread || log_error "nginx собран без ssl_preread, установите nginx из репозитория nginx.org"
+
+    ensure_server_ip
+    resolve_cascade_exits
+
+    if ! command -v jq >/dev/null; then
+        apt update -q
+        apt install -y -q jq curl
+    fi
+    ensure_cf_creds
+    DOMAIN="$CASCADE_ENTRY"
+    update_dns
+    echo "$CASCADE_ENTRY" > "$CASCADE_ENTRY_FILE"
+
+    main_backup=$(mktemp "${NGINX_CONF}.bak.$(date +%Y%m%d%H%M%S).XXXX")
+    cp -p "$NGINX_CONF" "$main_backup"
+    if [[ -f "$CASCADE_STREAM_CONF" ]]; then
+        conf_backup=$(mktemp "${CASCADE_STREAM_CONF}.bak.$(date +%Y%m%d%H%M%S).XXXX")
+        cp -p "$CASCADE_STREAM_CONF" "$conf_backup"
+    fi
+
+    log_info "Запись $CASCADE_STREAM_CONF..."
+    write_cascade_conf
+    patch_nginx_conf
+
+    if ! nginx -t; then
+        mv "$main_backup" "$NGINX_CONF"
+        if [[ -n "$conf_backup" ]]; then mv "$conf_backup" "$CASCADE_STREAM_CONF"; else rm -f "$CASCADE_STREAM_CONF"; fi
+        log_error "Конфигурация nginx невалидна, изменения откачены"
+    fi
+    rm -f "$main_backup" "$conf_backup"
+
+    systemctl enable nginx >/dev/null 2>&1 || true
+    systemctl reload-or-restart nginx
+    printf '%s\n' "${CASCADE_EXITS[@]}" > "$CASCADE_EXITS_FILE"
+
+    ufw_allow_ssh
+    for port in "${CASCADE_PORTS[@]}"; do
+        log_info "UFW: открываю ${port}/tcp"
+        ufw allow "${port}/tcp" comment 'cascade' >/dev/null
+    done
+    if ! ufw status | grep -q '^Status: active'; then
+        log_info "Включение ufw..."
+        ufw --force enable
+    fi
+
+    check_cascade_exits
+
+    echo
+    echo -e "${GREEN}════════════════════════════════════════${NC}"
+    echo -e "${GREEN}  Вход каскада настроен${NC}"
+    echo -e "${GREEN}════════════════════════════════════════${NC}"
+    echo -e "  Вход:      ${YELLOW}${CASCADE_ENTRY} → ${SERVER_IP}${NC}"
+    echo -e "  Порты:     ${YELLOW}${CASCADE_PORTS[*]}${NC}"
+    echo -e "  Выходы:    ${YELLOW}${CASCADE_EXITS[*]}${NC}"
+    echo -e "  Журнал:    ${YELLOW}tail -f /var/log/nginx/cascade.log${NC}"
+    echo -e "  Хостов в панели: ${YELLOW}$(( ${#CASCADE_EXITS[@]} * ${#CASCADE_PORTS[@]} ))${NC} (выход × порт): address = ${CASCADE_ENTRY}, sni = домен выхода,"
+    echo -e "  inbound профиля выхода, overrideSniFromAddress выключен"
+    echo -e "${GREEN}════════════════════════════════════════${NC}"
+}
+
 # ─── Сценарии ─────────────────────────────────────────────────────────────────
 run_issue() {
     read -rp "Введите домен (например sni.example.com): " DOMAIN
     [[ -z "$DOMAIN" ]] && log_error "Домен не может быть пустым"
 
     install_deps
-    load_creds
-    if [[ -z "$CF_API_TOKEN" || -z "$LE_EMAIL" ]]; then
-        log_warn "Cloudflare credentials не найдены, введите их"
-        ask_creds 0
-    else
-        verify_token
-        log_info "Используются сохранённые credentials ($LE_EMAIL)"
-    fi
-
-    SERVER_IP=$(detect_ip)
-    if [[ -z "$SERVER_IP" ]]; then
-        read -rp "Не удалось определить IP. Введите IP сервера: " SERVER_IP
-        [[ -z "$SERVER_IP" ]] && log_error "IP не может быть пустым"
-    fi
-    log_info "IP сервера: $SERVER_IP"
+    ensure_cf_creds
+    ensure_server_ip
 
     update_dns
     issue_cert
@@ -557,10 +814,11 @@ while true; do
     echo "4) Подключить geo-файлы (geo-zapret.dat, ip-zapret.dat) к ноде"
     echo "5) Спрятать от сканеров и открыть порты (traffic-guard + ufw)"
     echo "6) Очистить диск (журналы, apt, docker, логи)"
+    echo "7) Развернуть вход каскада на РФ-сервере (DNS входа + nginx → выходы по SNI)"
     echo
     echo "9) Указать Cloudflare авторизацию (email + API Token)"
     echo "0) Выход"
-    read -rp "Выберите действие [0-6, 9]: " choice
+    read -rp "Выберите действие [0-7, 9]: " choice
 
     case "$choice" in
         1) install_remnanode ;;
@@ -569,6 +827,7 @@ while true; do
         4) setup_geo_files ;;
         5) setup_firewall ;;
         6) cleanup_disk ;;
+        7) setup_cascade ;;
         9) run_auth ;;
         0) exit 0 ;;
         *) log_warn "Неверный выбор" ;;
