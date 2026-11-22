@@ -37,6 +37,10 @@ CASCADE_EXITS_FILE="/etc/nginx/cascade-exits.list"
 CASCADE_ENTRY_FILE="/etc/nginx/cascade-entry.domain"
 CASCADE_DEFAULT_PORTS="443 8443"
 CASCADE_CONNECT_TIMEOUT="4s"
+# Отдельная папка: /var/log/nginx/*.log уже ротирует пакет nginx, второй конфиг дал бы duplicate log entry
+CASCADE_LOG_DIR="/var/log/cascade"
+CASCADE_LOG="${CASCADE_LOG_DIR}/cascade.log"
+CASCADE_LOGROTATE_CONF="/etc/logrotate.d/cascade"
 
 # ─── Проверка root ────────────────────────────────────────────────────────────
 [[ "$EUID" -ne 0 ]] && log_error "Скрипт должен запускаться от root"
@@ -308,15 +312,29 @@ setup_geo_files() {
 }
 
 # ─── Logrotate ────────────────────────────────────────────────────────────────
-setup_logrotate() {
-    log_info "Создание $REMNANODE_LOG_DIR..."
-    mkdir -p "$REMNANODE_LOG_DIR"
-
+ensure_logrotate() {
     if ! command -v logrotate >/dev/null; then
         log_info "Установка logrotate..."
         apt update -q
         apt install -y -q logrotate
     fi
+}
+
+# Один файл в двух конфигах logrotate — ошибка, из-за которой ротация этих логов не идёт
+check_logrotate_conflicts() {
+    local dups
+    dups=$(logrotate -d /etc/logrotate.conf 2>&1 | grep -i 'duplicate log entry' || true)
+    if [[ -n "$dups" ]]; then
+        echo "$dups"
+        log_error "Найдены пересекающиеся конфиги logrotate, исправьте их"
+    fi
+}
+
+setup_logrotate() {
+    log_info "Создание $REMNANODE_LOG_DIR..."
+    mkdir -p "$REMNANODE_LOG_DIR"
+
+    ensure_logrotate
 
     log_info "Создание конфигурации $LOGROTATE_CONF..."
     cat > "$LOGROTATE_CONF" << EOF
@@ -336,6 +354,7 @@ EOF
     fi
 
     log_info "Проверка конфигурации logrotate..."
+    check_logrotate_conflicts
     logrotate -vf "$LOGROTATE_CONF" || log_error "logrotate завершился с ошибкой"
 
     log_info "Logrotate для remnanode настроен"
@@ -436,11 +455,7 @@ cleanup_disk() {
         fi
     fi
 
-    if ! command -v logrotate >/dev/null; then
-        log_info "Установка logrotate..."
-        apt update -q
-        apt install -y -q logrotate
-    fi
+    ensure_logrotate
     log_info "Принудительная ротация логов..."
     # logrotate.conf подключает logrotate.d/ вместе с глобальными настройками (su и т.п.)
     logrotate -vf /etc/logrotate.conf || log_warn "logrotate завершился с ошибкой"
@@ -608,7 +623,7 @@ write_cascade_conf() {
         echo
         echo "    log_format cascade '\$remote_addr [\$time_local] port=\$server_port sni=\$ssl_preread_server_name '"
         echo "                       'up=\$upstream_addr st=\$status in=\$bytes_received out=\$bytes_sent t=\$session_time';"
-        echo "    access_log /var/log/nginx/cascade.log cascade buffer=64k flush=5s;"
+        echo "    access_log ${CASCADE_LOG} cascade buffer=64k flush=5s;"
         for port in "${CASCADE_PORTS[@]}"; do
             echo
             echo "    map \$ssl_preread_server_name \$cascade_exit_${port} {"
@@ -676,6 +691,36 @@ check_cascade_exits() {
     done
 }
 
+# Лог каскада ротирует nginx через reopen (без copytruncate: буфер nginx не теряет строки)
+setup_cascade_logrotate() {
+    local nginx_bin
+    nginx_bin=$(command -v nginx)
+
+    ensure_logrotate
+
+    log_info "Создание конфигурации $CASCADE_LOGROTATE_CONF..."
+    cat > "$CASCADE_LOGROTATE_CONF" << EOF
+${CASCADE_LOG_DIR}/*.log {
+    size 50M
+    rotate 5
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root adm
+    sharedscripts
+    postrotate
+        ${nginx_bin} -s reopen >/dev/null 2>&1 || true
+    endscript
+}
+EOF
+    chmod 644 "$CASCADE_LOGROTATE_CONF"
+
+    check_logrotate_conflicts
+    logrotate -d "$CASCADE_LOGROTATE_CONF" >/dev/null 2>&1 || log_error "Конфигурация $CASCADE_LOGROTATE_CONF невалидна"
+    log_info "Logrotate для каскада настроен"
+}
+
 # Резолвит выходы; несколько A-записей у одного имени — группа нод одного профиля
 resolve_cascade_exits() {
     local d ips ip local_ips
@@ -733,6 +778,7 @@ setup_cascade() {
         cp -p "$CASCADE_STREAM_CONF" "$conf_backup"
     fi
 
+    mkdir -p "$CASCADE_LOG_DIR"
     log_info "Запись $CASCADE_STREAM_CONF..."
     write_cascade_conf
     patch_nginx_conf
@@ -747,6 +793,8 @@ setup_cascade() {
     systemctl enable nginx >/dev/null 2>&1 || true
     systemctl reload-or-restart nginx
     printf '%s\n' "${CASCADE_EXITS[@]}" > "$CASCADE_EXITS_FILE"
+
+    setup_cascade_logrotate
 
     ufw_allow_ssh
     for port in "${CASCADE_PORTS[@]}"; do
@@ -767,7 +815,7 @@ setup_cascade() {
     echo -e "  Вход:      ${YELLOW}${CASCADE_ENTRY} → ${SERVER_IP}${NC}"
     echo -e "  Порты:     ${YELLOW}${CASCADE_PORTS[*]}${NC}"
     echo -e "  Выходы:    ${YELLOW}${CASCADE_EXITS[*]}${NC}"
-    echo -e "  Журнал:    ${YELLOW}tail -f /var/log/nginx/cascade.log${NC}"
+    echo -e "  Журнал:    ${YELLOW}tail -f ${CASCADE_LOG}${NC}"
     echo -e "  Хостов в панели: ${YELLOW}$(( ${#CASCADE_EXITS[@]} * ${#CASCADE_PORTS[@]} ))${NC} (выход × порт): address = ${CASCADE_ENTRY}, sni = домен выхода,"
     echo -e "  inbound профиля выхода, overrideSniFromAddress выключен"
     echo -e "${GREEN}════════════════════════════════════════${NC}"
