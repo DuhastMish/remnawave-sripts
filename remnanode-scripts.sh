@@ -37,10 +37,23 @@ CASCADE_EXITS_FILE="/etc/nginx/cascade-exits.list"
 CASCADE_ENTRY_FILE="/etc/nginx/cascade-entry.domain"
 CASCADE_DEFAULT_PORTS="443 8443"
 CASCADE_CONNECT_TIMEOUT="4s"
+# Сессия stream занимает 2 соединения (клиент + выход): 16384 ≈ 8192 сессий на воркер (ядро).
+# При исчерпании лимита новые соединения не принимаются у всех пользователей входа
+CASCADE_WORKER_CONNECTIONS=16384
+CASCADE_RLIMIT_NOFILE=65535
+# Буфер на каждое направление сессии (по умолчанию 16k): вдвое меньше памяти на сессию
+CASCADE_PROXY_BUFFER="8k"
+NGINX_ERROR_LOG="/var/log/nginx/error.log"
 # Отдельная папка: /var/log/nginx/*.log уже ротирует пакет nginx, второй конфиг дал бы duplicate log entry
 CASCADE_LOG_DIR="/var/log/cascade"
 CASCADE_LOG="${CASCADE_LOG_DIR}/cascade.log"
 CASCADE_LOGROTATE_CONF="/etc/logrotate.d/cascade"
+BBR_SYSCTL_CONF="/etc/sysctl.d/90-bbr.conf"
+BBR_MODULES_CONF="/etc/modules-load.d/bbr.conf"
+CONNTRACK_SYSCTL_CONF="/etc/sysctl.d/91-conntrack.conf"
+CONNTRACK_MODULES_CONF="/etc/modules-load.d/nf_conntrack.conf"
+CONNTRACK_MODPROBE_CONF="/etc/modprobe.d/nf_conntrack.conf"
+CONNTRACK_MAX=262144
 
 # ─── Проверка root ────────────────────────────────────────────────────────────
 [[ "$EUID" -ne 0 ]] && log_error "Скрипт должен запускаться от root"
@@ -414,6 +427,7 @@ setup_firewall() {
         log_info "Включение ufw..."
         ufw --force enable
     fi
+    tune_conntrack
 
     ufw status verbose
     log_info "Traffic-guard и UFW настроены"
@@ -484,6 +498,83 @@ cleanup_disk() {
     after=$(df -k --output=avail / | tail -1)
     df -h /
     log_info "Очистка завершена, освобождено: $(( (after - before) / 1024 )) MB"
+}
+
+# ─── Conntrack ────────────────────────────────────────────────────────────────
+# ufw отслеживает каждое соединение. При заполнении таблицы ядро молча отбрасывает новые
+# соединения (dmesg: "nf_conntrack: table full"). По умолчанию пропавшее соединение живёт
+# в таблице 5 суток, а TIME_WAIT — 2 минуты, поэтому на прокси таблица забивается за часы
+tune_conntrack() {
+    local current max
+
+    modprobe nf_conntrack 2>/dev/null || true
+    current=$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || true)
+    if [[ -z "$current" ]]; then
+        log_info "conntrack не используется, пропускаю настройку"
+        return
+    fi
+    max=$(( current > CONNTRACK_MAX ? current : CONNTRACK_MAX ))
+
+    log_info "Настройка conntrack: лимит ${current} → ${max}, укороченные таймауты..."
+    # Модуль грузится до применения sysctl.d, иначе после перезагрузки настройки не применятся
+    echo "nf_conntrack" > "$CONNTRACK_MODULES_CONF"
+    echo "options nf_conntrack hashsize=$(( max / 4 ))" > "$CONNTRACK_MODPROBE_CONF"
+    # established 1 ч: больше proxy_timeout nginx (30 мин) и idle xray (5 мин), живые соединения не рвутся
+    cat > "$CONNTRACK_SYSCTL_CONF" << EOF
+net.netfilter.nf_conntrack_max = ${max}
+net.netfilter.nf_conntrack_tcp_timeout_established = 3600
+net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
+net.netfilter.nf_conntrack_tcp_timeout_fin_wait = 30
+net.netfilter.nf_conntrack_tcp_timeout_close_wait = 30
+net.netfilter.nf_conntrack_tcp_timeout_syn_sent = 30
+EOF
+    chmod 644 "$CONNTRACK_SYSCTL_CONF" "$CONNTRACK_MODULES_CONF" "$CONNTRACK_MODPROBE_CONF"
+
+    echo $(( max / 4 )) > /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null || true
+    sysctl -q -p "$CONNTRACK_SYSCTL_CONF" || log_warn "sysctl conntrack применился не полностью"
+
+    log_info "conntrack: занято $(sysctl -n net.netfilter.nf_conntrack_count) из $(sysctl -n net.netfilter.nf_conntrack_max)"
+    if dmesg 2>/dev/null | grep -q 'nf_conntrack: table full'; then
+        log_warn "В dmesg есть 'table full' — таблица переполнялась до настройки. Повторится — проверьте: dmesg -T | grep conntrack"
+    fi
+}
+
+# ─── BBR ──────────────────────────────────────────────────────────────────────
+setup_bbr() {
+    local cc qdisc
+
+    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
+    qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || true)
+    log_info "Сейчас: congestion control = ${cc:-?}, qdisc = ${qdisc:-?}"
+
+    if [[ "$cc" == bbr && "$qdisc" == fq && -f "$BBR_SYSCTL_CONF" ]]; then
+        log_info "BBR уже включён"
+        return
+    fi
+
+    modprobe tcp_bbr 2>/dev/null || true
+    if ! sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+        log_error "Ядро $(uname -r) не поддерживает BBR (нужно ядро 4.9+, на OpenVZ/LXC модуль ядра не загрузить)"
+    fi
+
+    log_info "Запись $BBR_SYSCTL_CONF..."
+    echo "tcp_bbr" > "$BBR_MODULES_CONF"
+    cat > "$BBR_SYSCTL_CONF" << EOF
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+EOF
+    chmod 644 "$BBR_SYSCTL_CONF" "$BBR_MODULES_CONF"
+
+    sysctl -q -p "$BBR_SYSCTL_CONF" || log_warn "sysctl применился не полностью"
+
+    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
+    if [[ "$cc" != bbr ]]; then
+        rm -f "$BBR_SYSCTL_CONF" "$BBR_MODULES_CONF"
+        log_error "BBR не включился (congestion control = ${cc:-?}), настройки удалены"
+    fi
+
+    # default_qdisc действует на новые интерфейсы; BBR и без fq работает (своя пейсинг-логика ядра 4.13+)
+    log_info "BBR включён для новых соединений. qdisc fq применится к интерфейсам после перезагрузки"
 }
 
 # ─── Установка ноды ───────────────────────────────────────────────────────────
@@ -641,6 +732,7 @@ write_cascade_conf() {
             echo "        proxy_next_upstream on;    # нода группы не отвечает — пробуем следующую A-запись"
             echo "        proxy_timeout 30m;"
             echo "        proxy_socket_keepalive on;"
+            echo "        proxy_buffer_size ${CASCADE_PROXY_BUFFER};"
             echo "    }"
         done
         echo "}"
@@ -652,10 +744,29 @@ patch_nginx_conf() {
     if ! grep -q "include ${CASCADE_STREAM_CONF};" "$NGINX_CONF"; then
         printf '\ninclude %s;\n' "$CASCADE_STREAM_CONF" >> "$NGINX_CONF"
     fi
-    if ! grep -Eq '^[[:space:]]*worker_rlimit_nofile' "$NGINX_CONF"; then
-        sed -i -E '0,/^[[:space:]]*worker_processes/s//worker_rlimit_nofile 65535;\n&/' "$NGINX_CONF"
+    local nofile
+    nofile=$(sed -n -E 's/^[[:space:]]*worker_rlimit_nofile[[:space:]]+([0-9]+);.*/\1/p' "$NGINX_CONF" | head -1)
+    if [[ -z "$nofile" ]]; then
+        sed -i -E "0,/^[[:space:]]*worker_processes/s//worker_rlimit_nofile ${CASCADE_RLIMIT_NOFILE};\n&/" "$NGINX_CONF"
+    elif (( nofile < CASCADE_RLIMIT_NOFILE )); then
+        sed -i -E "s/^([[:space:]]*worker_rlimit_nofile)[[:space:]]+[0-9]+;/\1 ${CASCADE_RLIMIT_NOFILE};/" "$NGINX_CONF"
     fi
-    sed -i -E 's/^([[:space:]]*worker_connections)[[:space:]]+[0-9]+;/\1 8192;/' "$NGINX_CONF"
+    sed -i -E "s/^([[:space:]]*worker_connections)[[:space:]]+[0-9]+;/\1 ${CASCADE_WORKER_CONNECTIONS};/" "$NGINX_CONF"
+}
+
+# Упирался ли вход в лимит соединений и сколько сессий держит сейчас
+check_cascade_capacity() {
+    local workers sessions capacity hits=0
+    workers=$(nproc 2>/dev/null || echo 1)
+    capacity=$(( CASCADE_WORKER_CONNECTIONS / 2 * workers ))
+    sessions=$(ss -Htn state established "( $(printf 'sport = :%s or ' "${CASCADE_PORTS[@]}" | sed 's/ or $//') )" 2>/dev/null | wc -l)
+    log_info "Сессий сейчас: ${sessions}, ёмкость входа: ~${capacity} (${workers} ядер × ${CASCADE_WORKER_CONNECTIONS} / 2)"
+
+    [[ -f "$NGINX_ERROR_LOG" ]] && hits=$(grep -c 'worker_connections are not enough' "$NGINX_ERROR_LOG" || true)
+    if (( hits > 0 )); then
+        log_warn "В $NGINX_ERROR_LOG ${hits} раз(а) 'worker_connections are not enough' — вход упирался в лимит, в эти моменты новые подключения не открывались"
+        log_warn "Если это повторится после текущей настройки — нужен вход с большим числом ядер или второй вход"
+    fi
 }
 
 # Печатает subject сертификата, если TLS-рукопожатие с этим SNI прошло
@@ -805,8 +916,10 @@ setup_cascade() {
         log_info "Включение ufw..."
         ufw --force enable
     fi
+    tune_conntrack
 
     check_cascade_exits
+    check_cascade_capacity
 
     echo
     echo -e "${GREEN}════════════════════════════════════════${NC}"
@@ -862,11 +975,12 @@ while true; do
     echo "4) Подключить geo-файлы (geo-zapret.dat, ip-zapret.dat) к ноде"
     echo "5) Спрятать от сканеров и открыть порты (traffic-guard + ufw)"
     echo "6) Очистить диск (журналы, apt, docker, логи)"
-    echo "7) Развернуть вход каскада на РФ-сервере (DNS входа + nginx → выходы по SNI)"
+    echo "7) Включить BBR (ускорение TCP на длинных каналах)"
+    echo "8) Развернуть вход каскада на РФ-сервере (DNS входа + nginx → выходы по SNI)"
     echo
     echo "9) Указать Cloudflare авторизацию (email + API Token)"
     echo "0) Выход"
-    read -rp "Выберите действие [0-7, 9]: " choice
+    read -rp "Выберите действие [0-9]: " choice
 
     case "$choice" in
         1) install_remnanode ;;
@@ -875,7 +989,8 @@ while true; do
         4) setup_geo_files ;;
         5) setup_firewall ;;
         6) cleanup_disk ;;
-        7) setup_cascade ;;
+        7) setup_bbr ;;
+        8) setup_cascade ;;
         9) run_auth ;;
         0) exit 0 ;;
         *) log_warn "Неверный выбор" ;;
