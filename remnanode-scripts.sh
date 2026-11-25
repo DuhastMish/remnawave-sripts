@@ -55,6 +55,8 @@ CASCADE_SESSION_KB=64                     # память на сессию: бу
 CASCADE_PORTS_SYSCTL_CONF="/etc/sysctl.d/92-cascade.conf"
 # Буфер на каждое направление сессии (по умолчанию 16k): вдвое меньше памяти на сессию
 CASCADE_PROXY_BUFFER="8k"
+# Очередь ещё не принятых подключений на каждый воркер (reuseport); по умолчанию в nginx 511
+CASCADE_LISTEN_BACKLOG=4096
 NGINX_ERROR_LOG="/var/log/nginx/error.log"
 # Отдельная папка: /var/log/nginx/*.log уже ротирует пакет nginx, второй конфиг дал бы duplicate log entry
 CASCADE_LOG_DIR="/var/log/cascade"
@@ -559,14 +561,15 @@ EOF
 
 # ─── BBR ──────────────────────────────────────────────────────────────────────
 setup_bbr() {
-    local cc qdisc
+    local cc qdisc mtu
 
     cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
     qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || true)
-    log_info "Сейчас: congestion control = ${cc:-?}, qdisc = ${qdisc:-?}"
+    mtu=$(sysctl -n net.ipv4.tcp_mtu_probing 2>/dev/null || true)
+    log_info "Сейчас: congestion control = ${cc:-?}, qdisc = ${qdisc:-?}, mtu_probing = ${mtu:-?}"
 
-    if [[ "$cc" == bbr && "$qdisc" == fq && -f "$BBR_SYSCTL_CONF" ]]; then
-        log_info "BBR уже включён"
+    if [[ "$cc" == bbr && "$qdisc" == fq && "$mtu" == 1 && -f "$BBR_SYSCTL_CONF" ]]; then
+        log_info "BBR и MTU probing уже включены"
         return
     fi
 
@@ -580,6 +583,9 @@ setup_bbr() {
     cat > "$BBR_SYSCTL_CONF" << EOF
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
+# ICMP "слишком большой пакет" часто режут (ТСПУ, мобильные сети): без этого соединение
+# зависает на крупных пакетах, а TCP с probing сам находит рабочий размер
+net.ipv4.tcp_mtu_probing = 1
 EOF
     chmod 644 "$BBR_SYSCTL_CONF" "$BBR_MODULES_CONF"
 
@@ -736,6 +742,7 @@ CASCADE_PORTS="${CASCADE_PORTS[*]}"
 CASCADE_LOG="${CASCADE_LOG}"
 CASCADE_CONNECT_TIMEOUT="${CASCADE_CONNECT_TIMEOUT}"
 CASCADE_PROXY_BUFFER="${CASCADE_PROXY_BUFFER}"
+CASCADE_LISTEN_BACKLOG=${CASCADE_LISTEN_BACKLOG}
 CASCADE_ABSENT_LIMIT=${CASCADE_ABSENT_LIMIT}
 CASCADE_STREAM_CONF="${CASCADE_STREAM_CONF}"
 CASCADE_EXITS_FILE="${CASCADE_EXITS_FILE}"
@@ -830,7 +837,7 @@ tmp=$(mktemp "${CASCADE_STREAM_CONF}.XXXX")
         echo "    }"
         echo
         echo "    server {"
-        echo "        listen ${port} reuseport;"
+        echo "        listen ${port} reuseport backlog=${CASCADE_LISTEN_BACKLOG};"
         echo "        ssl_preread on;"
         echo "        proxy_pass \$cascade_exit_${port};"
         echo "        proxy_connect_timeout ${CASCADE_CONNECT_TIMEOUT};"
@@ -923,10 +930,18 @@ cascade_compute_limits() {
 
 # Исходящих портов к одному IP:порту выхода по умолчанию ~28 тыс. (32768–60999) — расширяем до ~55 тыс.
 # tcp_tw_reuse=1 позволяет повторно брать порты исходящих соединений из TIME_WAIT
+# tcp_mtu_probing — как в пункте 7, чтобы вход получил его и без отдельного запуска BBR.
+# somaxconn — потолок очереди listen (backlog в конфиге каскада); больший не уменьшаем
 setup_cascade_sysctl() {
+    local somaxconn
+    somaxconn=$(sysctl -n net.core.somaxconn 2>/dev/null || echo 0)
+    (( somaxconn < CASCADE_LISTEN_BACKLOG )) && somaxconn=$CASCADE_LISTEN_BACKLOG
+
     cat > "$CASCADE_PORTS_SYSCTL_CONF" << EOF
 net.ipv4.ip_local_port_range = 10000 65535
 net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_mtu_probing = 1
+net.core.somaxconn = ${somaxconn}
 EOF
     chmod 644 "$CASCADE_PORTS_SYSCTL_CONF"
     sysctl -q -p "$CASCADE_PORTS_SYSCTL_CONF" || log_warn "sysctl $CASCADE_PORTS_SYSCTL_CONF применился не полностью"
