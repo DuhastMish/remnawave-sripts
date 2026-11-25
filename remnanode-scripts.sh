@@ -537,9 +537,14 @@ tune_conntrack() {
 net.netfilter.nf_conntrack_max = ${max}
 net.netfilter.nf_conntrack_tcp_timeout_established = 3600
 net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
-net.netfilter.nf_conntrack_tcp_timeout_fin_wait = 30
-net.netfilter.nf_conntrack_tcp_timeout_close_wait = 30
 net.netfilter.nf_conntrack_tcp_timeout_syn_sent = 30
+# Закрытие соединения — стандартные значения: медленные (мобильные) клиенты и выходы досылают
+# FIN и данные позже 30 с, и при коротких таймаутах ufw выбрасывает эти «хвосты»
+net.netfilter.nf_conntrack_tcp_timeout_fin_wait = 120
+net.netfilter.nf_conntrack_tcp_timeout_close_wait = 60
+# Не считать INVALID пакеты вне отслеживаемого TCP-окна (перестановки, повторы на больших потоках):
+# иначе ufw выбрасывает данные живых сессий (ctstate INVALID → DROP)
+net.netfilter.nf_conntrack_tcp_be_liberal = 1
 EOF
     chmod 644 "$CONNTRACK_SYSCTL_CONF" "$CONNTRACK_MODULES_CONF" "$CONNTRACK_MODPROBE_CONF"
 
