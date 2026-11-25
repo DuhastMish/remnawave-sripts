@@ -23,6 +23,11 @@ XRAY_SHARE_DIR="/usr/local/share/xray"
 GEO_FILES=(geo-zapret.dat ip-zapret.dat)
 NODE_PORT=2222
 SELFSTEAL_URL="https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh"
+# Каталоги и контейнеры, которые создаёт selfsteal (Caddy — по умолчанию, nginx — с --nginx)
+SELFSTEAL_CADDY_DIR="/opt/caddy"
+SELFSTEAL_CADDY_CONTAINER="caddy-selfsteal"
+SELFSTEAL_NGINX_DIR="/opt/nginx-selfsteal"
+SELFSTEAL_DEFAULT_PORT=9443
 CF_API="https://api.cloudflare.com/client/v4"
 DOCKER_INSTALL_URL="https://get.docker.com"
 TRAFFIC_GUARD_INSTALL_URL="https://raw.githubusercontent.com/dotX12/traffic-guard/master/install.sh"
@@ -203,13 +208,38 @@ update_dns() {
 }
 
 # ─── Сертификат ───────────────────────────────────────────────────────────────
+# Разбирает "a.example.com, B.example.com,a.example.com" в DOMAINS: без пробелов, в нижнем
+# регистре, без дублей. Первый — основной (DOMAIN), остальные — дополнительные (EXTRA_DOMAINS)
+parse_domains() {
+    local d parts=()
+    DOMAINS=()
+    # read -ra, а не for in $(...): иначе "*.example.com" раскрылся бы в имена файлов
+    read -ra parts <<< "$(tr ',;' '  ' <<< "$1" | tr '[:upper:]' '[:lower:]')"
+    for d in "${parts[@]}"; do
+        d="${d%.}"
+        (( ${#d} <= 253 )) && [[ "$d" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+([a-z]{2,63}|xn--[a-z0-9-]{1,59})$ ]] \
+            || log_error "Некорректный домен: $d"
+        [[ " ${DOMAINS[*]} " == *" $d "* ]] || DOMAINS+=("$d")
+    done
+    (( ${#DOMAINS[@]} > 0 )) || log_error "Домен не может быть пустым"
+    DOMAIN="${DOMAINS[0]}"
+    EXTRA_DOMAINS=("${DOMAINS[@]:1}")
+}
+
 issue_cert() {
-    log_info "Получение сертификата для домена: $DOMAIN"
+    local args=() d
+    for d in "${DOMAINS[@]}"; do args+=(-d "$d"); done
+
+    log_info "Получение сертификата: основной $DOMAIN${EXTRA_DOMAINS[*]:+, дополнительные: ${EXTRA_DOMAINS[*]}}"
+    # --cert-name держит сертификат в live/<основной>; --expand добавляет новые имена
+    # в существующий сертификат, а не создаёт второй
     certbot certonly \
         --dns-cloudflare \
         --dns-cloudflare-credentials "$CF_CREDS_FILE" \
         --dns-cloudflare-propagation-seconds 30 \
-        -d "$DOMAIN" \
+        --cert-name "$DOMAIN" \
+        "${args[@]}" \
+        --expand \
         --keep-until-expiring \
         --agree-tos \
         -m "$LE_EMAIL" \
@@ -242,6 +272,117 @@ install_selfsteal() {
         --domain "$DOMAIN" \
         --ssl-cert "${XRAY_SSL_DIR}/cert.pem" \
         --ssl-key "${XRAY_SSL_DIR}/cert.key"
+}
+
+# Отдаёт ли сайт на $1 (host:port) для SNI $2 именно наш сертификат.
+# Простого ответа мало: на неизвестное имя Caddy отвечает своим самоподписанным (tls internal)
+selfsteal_serves_our_cert() {
+    local want got
+    want=$(openssl x509 -in "${XRAY_SSL_DIR}/cert.pem" -noout -fingerprint -sha256 2>/dev/null)
+    got=$(timeout 8 openssl s_client -connect "$1" -servername "$2" </dev/null 2>/dev/null \
+        | openssl x509 -noout -fingerprint -sha256 2>/dev/null)
+    [[ -n "$got" && "$got" == "$want" ]]
+}
+
+# Код HTTP-ответа сайта selfsteal на $1 (host:port) для имени $2
+selfsteal_http_code() {
+    curl -sk -o /dev/null -w '%{http_code}' --max-time 8 \
+        --resolve "${2}:${1##*:}:${1%:*}" "https://${2}:${1##*:}/" 2>/dev/null
+}
+
+# Имя обслуживает сайт: наш сертификат и тот же ответ, что у основного домена ($3).
+# Сертификата мало: Caddy подбирает его по SAN для любого имени, но без своего сайта
+# запрос уходит в общий блок «:порт { respond 204 }» — пустой ответ вместо сайта
+selfsteal_serves_name() {
+    selfsteal_serves_our_cert "$1" "$2" && [[ "$(selfsteal_http_code "$1" "$2")" == "$3" ]]
+}
+
+# selfsteal принимает только один --domain. В Caddy дополнительные имена добавляются в адрес
+# сайта через запятую: https://{$SELF_STEAL_DOMAIN}, https://доп {. Повторный запуск
+# пересобирает строку заново, поэтому дублей не будет
+add_selfsteal_caddy_names() {
+    local caddyfile="${SELFSTEAL_CADDY_DIR}/Caddyfile" line backup tmp n matches
+    local site_re='^https://\{\$SELF_STEAL_DOMAIN\}(, https://[^ ,{]+)* \{$'
+
+    if [[ ! -f "$caddyfile" ]]; then
+        if [[ -d "$SELFSTEAL_NGINX_DIR" ]]; then
+            log_warn "selfsteal работает на nginx (сокет + proxy_protocol) — автоматически добавить имена нельзя."
+            log_warn "Добавьте их вручную в server_name в ${SELFSTEAL_NGINX_DIR}/conf.d/selfsteal.conf"
+        else
+            log_warn "$caddyfile не найден — не могу добавить дополнительные имена в selfsteal"
+        fi
+        return 1
+    fi
+
+    matches=$(grep -cE "$site_re" "$caddyfile" || true)
+    if [[ "$matches" != 1 ]]; then
+        log_warn "В $caddyfile не найден ожидаемый адрес сайта https://{\$SELF_STEAL_DOMAIN} — формат selfsteal изменился, конфиг не трогаю"
+        return 1
+    fi
+
+    line='https://{$SELF_STEAL_DOMAIN}'
+    for n in "${EXTRA_DOMAINS[@]}"; do line+=", https://${n}"; done
+    line+=' {'
+
+    backup=$(mktemp "${caddyfile}.bak.$(date +%Y%m%d%H%M%S).XXXX")
+    cp -p "$caddyfile" "$backup"
+    tmp=$(mktemp)
+    # Через ENVIRON: awk -v превратил бы \$ в якорь $
+    SITE_RE="$site_re" NEW_LINE="$line" awk '$0 ~ ENVIRON["SITE_RE"] { print ENVIRON["NEW_LINE"]; next } { print }' \
+        "$caddyfile" > "$tmp"
+    # Caddyfile примонтирован в контейнер отдельным файлом: пишем поверх, сохраняя inode,
+    # иначе контейнер продолжит видеть старое содержимое
+    cat "$tmp" > "$caddyfile"
+    rm -f "$tmp"
+    log_info "Добавляю в Caddyfile selfsteal имена: ${EXTRA_DOMAINS[*]} (бэкап: $backup)"
+
+    if ! docker exec "$SELFSTEAL_CADDY_CONTAINER" caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1; then
+        cat "$backup" > "$caddyfile"
+        log_warn "Caddy не принял изменённый Caddyfile (или контейнер $SELFSTEAL_CADDY_CONTAINER не запущен) — конфиг восстановлен из бэкапа"
+        return 1
+    fi
+    rm -f "$backup"
+
+    docker restart "$SELFSTEAL_CADDY_CONTAINER" >/dev/null \
+        || { log_warn "Не удалось перезапустить $SELFSTEAL_CADDY_CONTAINER"; return 1; }
+}
+
+# Отдаёт ли selfsteal сайт на дополнительные имена так же, как на основной; если нет — добавляет их в Caddy
+check_selfsteal_names() {
+    local port addr ref n i missing=()
+
+    port=$(sed -n 's/^SELF_STEAL_PORT=//p' "${SELFSTEAL_CADDY_DIR}/.env" 2>/dev/null)
+    addr="127.0.0.1:${port:-$SELFSTEAL_DEFAULT_PORT}"
+
+    ref=$(selfsteal_http_code "$addr" "$DOMAIN")
+    if ! selfsteal_serves_our_cert "$addr" "$DOMAIN" || [[ -z "$ref" || "$ref" == 000 ]]; then
+        log_warn "selfsteal на $addr не отвечает на основной домен $DOMAIN — проверку доп. имён пропускаю"
+        return 0
+    fi
+
+    for n in "${EXTRA_DOMAINS[@]}"; do
+        selfsteal_serves_name "$addr" "$n" "$ref" || missing+=("$n")
+    done
+    if (( ${#missing[@]} == 0 )); then
+        log_info "selfsteal на $addr отдаёт сайт для всех дополнительных имён"
+        return 0
+    fi
+
+    log_info "selfsteal не отдаёт сайт (наш сертификат и ответ $ref) для: ${missing[*]}"
+    add_selfsteal_caddy_names || return 0
+
+    for n in "${missing[@]}"; do
+        for i in $(seq 15); do
+            ref=$(selfsteal_http_code "$addr" "$DOMAIN")
+            selfsteal_serves_name "$addr" "$n" "$ref" && break
+            sleep 1
+        done
+        if selfsteal_serves_name "$addr" "$n" "$ref"; then
+            log_info "selfsteal: $n — OK"
+        else
+            log_warn "selfsteal по-прежнему не отдаёт сайт для $n"
+        fi
+    done
 }
 
 # ─── Перезапуск remnawave ─────────────────────────────────────────────────────
@@ -706,6 +847,32 @@ read_cascade_exits() {
         [[ "$d" =~ ^[0-9]+$ && "$d" -ge 1 && "$d" -le 65535 ]] || log_error "Некорректный порт: $d"
         CASCADE_PORTS+=("$d")
     done
+
+    read_cascade_udp_map
+}
+
+# Необязательная UDP-пересылка (Hysteria2): пары "порт:домен" → upstream домена на порт 443.
+# Значение хранится в cascade.env и предлагается при повторном запуске; "-" — отключить
+read_cascade_udp_map() {
+    local saved input pair uport ud pairs=()
+    saved=$(sed -n 's/^CASCADE_UDP_MAP="\(.*\)"$/\1/p' "$CASCADE_ENV_FILE" 2>/dev/null)
+
+    echo "UDP-пересылка (Hysteria2): пары порт:домен через пробел, например 44301:kraw-pl.example.com"
+    read -rp "UDP-пары (Enter — ${saved:-нет}, '-' — отключить): " input
+    [[ "$input" == "-" ]] && { CASCADE_UDP_MAP=""; return; }
+    input="${input:-$saved}"
+
+    for pair in $(tr ',;' '  ' <<< "$input" | tr '[:upper:]' '[:lower:]'); do
+        uport="${pair%%:*}" ud="${pair#*:}"
+        [[ "$pair" == *:* && "$uport" =~ ^[0-9]+$ && "$uport" -ge 1 && "$uport" -le 65535 ]] \
+            || log_error "Некорректная UDP-пара: $pair (нужно порт:домен)"
+        [[ "$ud" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]] \
+            || log_error "Некорректный домен в UDP-паре: $pair"
+        [[ " ${CASCADE_EXITS[*]} " == *" $ud "* && " ${CASCADE_PORTS[*]} " == *" 443 "* ]] \
+            || log_warn "$pair: UDP использует upstream ${ud} на порт 443 — нужен этот выход в списке и порт 443, иначе пара будет пропущена"
+        pairs+=("${uport}:${ud}")
+    done
+    CASCADE_UDP_MAP="${pairs[*]}"
 }
 
 # Порт должен быть свободен или занят самим nginx (повторный запуск)
@@ -747,8 +914,12 @@ CASCADE_ABSENT_LIMIT=${CASCADE_ABSENT_LIMIT}
 CASCADE_STREAM_CONF="${CASCADE_STREAM_CONF}"
 CASCADE_EXITS_FILE="${CASCADE_EXITS_FILE}"
 CASCADE_STATE_FILE="${CASCADE_STATE_FILE}"
+# Необязательно: UDP-порты (Hysteria2) → upstream домена на порт 443, пары "порт:домен" через пробел
+CASCADE_UDP_MAP="${CASCADE_UDP_MAP:-}"
 EOF
 
+    # Скрипт перезаписывается при каждом запуске пункта 8 (переход на новую версию);
+    # cascade-exits.list и cascade-exits.state он только читает и обновляет
     cat > "$CASCADE_REFRESH_BIN" << 'EOF'
 #!/bin/bash
 # Сгенерировано remnanode-scripts.sh (пункт 8). Узнаёт IP выходов каскада и обновляет конфиг nginx.
@@ -763,7 +934,8 @@ lookup() {
     local out status ips
     out=$(dig +time=2 +tries=2 +noall +comments +answer "$1" A 2>/dev/null)
     status=$(grep -oP 'status: \K\w+' <<< "$out" | head -1)
-    ips=$(awk '$4 == "A" { print $5 }' <<< "$out" | sort -u | tr '\n' ' ')
+    # sort -V: порядок ответа dig меняется, а файл и reload от этого меняться не должны
+    ips=$(awk '$4 == "A" { print $5 }' <<< "$out" | sort -u -V | tr '\n' ' ')
     if [[ "$status" == NOERROR && -n "$ips" ]]; then echo "ok $ips"
     elif [[ "$status" == NXDOMAIN || "$status" == NOERROR ]]; then echo "absent"
     else echo "failed"; fi
@@ -825,7 +997,12 @@ tmp=$(mktemp "${CASCADE_STREAM_CONF}.XXXX")
             [[ -n "${cur[$d]:-}" ]] || continue
             echo
             echo "    upstream $(upstream_name "$d" "$port") {"
-            for ip in ${cur[$d]}; do echo "        server ${ip}:${port};"; done
+            # Клиент держится одной ноды группы (стабильный внешний IP); при смене состава
+            # нод переезжает только часть клиентов. Одна и та же нода для TCP и UDP
+            echo "        hash \$remote_addr consistent;"
+            for ip in $(tr ' ' '\n' <<< "${cur[$d]}" | sort -u -V); do
+                echo "        server ${ip}:${port} max_fails=2 fail_timeout=15s;"
+            done
             echo "    }"
         done
         echo
@@ -845,6 +1022,25 @@ tmp=$(mktemp "${CASCADE_STREAM_CONF}.XXXX")
         echo "        proxy_timeout 30m;"
         echo "        proxy_socket_keepalive on;"
         echo "        proxy_buffer_size ${CASCADE_PROXY_BUFFER};"
+        echo "    }"
+    done
+
+    # UDP (Hysteria2): тот же upstream домена на порт 443 — SNI в QUIC не прочитать, выход задаёт порт
+    for pair in ${CASCADE_UDP_MAP:-}; do
+        uport="${pair%%:*}" ud="${pair#*:}"
+        if [[ "$pair" != *:* || ! "$uport" =~ ^[0-9]+$ ]]; then
+            echo "CASCADE_UDP_MAP: неверная пара '$pair' — пропущена" >&2
+            continue
+        fi
+        if [[ " $CASCADE_PORTS " != *" 443 "* || -z "${cur[$ud]:-}" ]]; then
+            echo "CASCADE_UDP_MAP: нет upstream $(upstream_name "$ud" 443) — UDP-порт $uport пропущен" >&2
+            continue
+        fi
+        echo
+        echo "    server {"
+        echo "        listen ${uport} udp reuseport;"
+        echo "        proxy_pass $(upstream_name "$ud" 443);"
+        echo "        proxy_timeout 120s;"
         echo "    }"
     done
     echo "}"
@@ -1129,12 +1325,19 @@ setup_cascade() {
     systemctl enable --now "${CASCADE_REFRESH_UNIT}.timer" >/dev/null 2>&1 \
         || log_warn "Не удалось включить ${CASCADE_REFRESH_UNIT}.timer — IP выходов не будут обновляться автоматически"
 
+    log_info "Upstream'ы в загруженной конфигурации nginx:"
+    nginx -T 2>/dev/null | grep -A3 "upstream cascade_" || log_warn "upstream cascade_ не найдены — проверьте журнал: journalctl -u ${CASCADE_REFRESH_UNIT}"
+
     setup_cascade_logrotate
 
     ufw_allow_ssh
     for port in "${CASCADE_PORTS[@]}"; do
         log_info "UFW: открываю ${port}/tcp"
         ufw allow "${port}/tcp" comment 'cascade' >/dev/null
+    done
+    for port in ${CASCADE_UDP_MAP:-}; do
+        log_info "UFW: открываю ${port%%:*}/udp (${port#*:})"
+        ufw allow "${port%%:*}/udp" comment 'cascade-udp' >/dev/null
     done
     if ! ufw status | grep -q '^Status: active'; then
         log_info "Включение ufw..."
@@ -1152,6 +1355,7 @@ setup_cascade() {
     echo -e "${GREEN}════════════════════════════════════════${NC}"
     echo -e "  Вход:      ${YELLOW}${CASCADE_ENTRY} → ${SERVER_IP}${NC}"
     echo -e "  Порты:     ${YELLOW}${CASCADE_PORTS[*]}${NC}"
+    [[ -n "${CASCADE_UDP_MAP:-}" ]] && echo -e "  UDP:       ${YELLOW}${CASCADE_UDP_MAP}${NC} (порт:выход, upstream на 443)"
     echo -e "  Выходы:    ${YELLOW}${CASCADE_EXITS[*]}${NC}"
     echo -e "  Журнал:    ${YELLOW}tail -f ${CASCADE_LOG}${NC}"
     echo -e "  IP выходов: ${YELLOW}обновляются раз в минуту, журнал: journalctl -u ${CASCADE_REFRESH_UNIT}${NC}"
@@ -1162,24 +1366,34 @@ setup_cascade() {
 
 # ─── Сценарии ─────────────────────────────────────────────────────────────────
 run_issue() {
-    read -rp "Введите домен (например sni.example.com): " DOMAIN
-    [[ -z "$DOMAIN" ]] && log_error "Домен не может быть пустым"
+    local input
+    echo "Домены через запятую: первый — основной (его A-запись укажет на этот сервер),"
+    echo "остальные — дополнительные имена сертификата (их DNS-записи не меняются)"
+    read -rp "Домены (например sni.example.com или sni-1.example.com,sni.example.com): " input
+    parse_domains "$input"
 
     install_deps
     ensure_cf_creds
     ensure_server_ip
 
+    # Только основной домен: у дополнительных может быть пул A-записей, одна запись его сломает
     update_dns
     issue_cert
     install_selfsteal
+    (( ${#EXTRA_DOMAINS[@]} > 0 )) && check_selfsteal_names
     add_compose_volume "${XRAY_SSL_DIR}:${XRAY_SSL_DIR}:ro" || true
     restart_remnawave
+
+    echo
+    log_info "Имена в сертификате:"
+    openssl x509 -in "${XRAY_SSL_DIR}/cert.pem" -noout -ext subjectAltName
 
     echo
     echo -e "${GREEN}════════════════════════════════════════${NC}"
     echo -e "${GREEN}  Готово!${NC}"
     echo -e "${GREEN}════════════════════════════════════════${NC}"
     echo -e "  Домен:       ${YELLOW}${DOMAIN} → ${SERVER_IP}${NC}"
+    (( ${#EXTRA_DOMAINS[@]} > 0 )) && echo -e "  Доп. имена:  ${YELLOW}${EXTRA_DOMAINS[*]}${NC} (DNS не менялся)"
     echo -e "  Сертификат:  ${YELLOW}${XRAY_SSL_DIR}/cert.pem${NC}"
     echo -e "  Ключ:        ${YELLOW}${XRAY_SSL_DIR}/cert.key${NC}"
     echo -e "  Обновление:  ${YELLOW}автоматически через certbot renew${NC}"
