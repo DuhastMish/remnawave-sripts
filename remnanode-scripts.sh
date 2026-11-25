@@ -35,6 +35,13 @@ NGINX_CONF="/etc/nginx/nginx.conf"
 CASCADE_STREAM_CONF="/etc/nginx/cascade-stream.conf"
 CASCADE_EXITS_FILE="/etc/nginx/cascade-exits.list"
 CASCADE_ENTRY_FILE="/etc/nginx/cascade-entry.domain"
+# IP выходов узнаёт таймер (раз в минуту), а не nginx при каждом подключении:
+# сбой DNS не рвёт сессии, при нём остаются прежние адреса
+CASCADE_ENV_FILE="/etc/nginx/cascade.env"
+CASCADE_STATE_FILE="/etc/nginx/cascade-exits.state"
+CASCADE_REFRESH_BIN="/usr/local/sbin/cascade-refresh"
+CASCADE_REFRESH_UNIT="cascade-refresh"
+CASCADE_ABSENT_LIMIT=5                    # проверок подряд без A-записи, после которых выход исключается
 CASCADE_DEFAULT_PORTS="443 8443"
 CASCADE_CONNECT_TIMEOUT="4s"
 # Лимиты входа считаются от размера сервера (cascade_compute_limits).
@@ -701,48 +708,184 @@ check_cascade_ports() {
     done
 }
 
-# Системный DNS (обычно 127.0.0.53); публичные резолверы из РФ могут быть недоступны
-cascade_resolvers() {
-    local ns
-    ns=$(awk '$1 == "nameserver" && $2 ~ /^[0-9.]+$/ { print $2 }' /etc/resolv.conf 2>/dev/null | tr '\n' ' ')
-    echo "${ns:-1.1.1.1 8.8.8.8}"
+# Статус имени в DNS: "ok IP..." | "absent" (NXDOMAIN или нет A-записи) | "failed" (таймаут, SERVFAIL)
+cascade_lookup() {
+    local out status ips
+    out=$(dig +time=2 +tries=2 +noall +comments +answer "$1" A 2>/dev/null)
+    status=$(grep -oP 'status: \K\w+' <<< "$out" | head -1)
+    ips=$(awk '$4 == "A" { print $5 }' <<< "$out" | sort -u | tr '\n' ' ')
+    if [[ "$status" == NOERROR && -n "$ips" ]]; then
+        echo "ok $ips"
+    elif [[ "$status" == NXDOMAIN || "$status" == NOERROR ]]; then
+        echo "absent"
+    else
+        echo "failed"
+    fi
 }
 
-write_cascade_conf() {
-    local port d resolvers
-    resolvers=$(cascade_resolvers)
+# Ставит cascade-refresh и таймер systemd. Скрипт генерирует конфиг nginx с IP выходов
+# в upstream-блоках; запускается раз в минуту и при первичной установке (--no-reload)
+install_cascade_refresh() {
+    cat > "$CASCADE_ENV_FILE" << EOF
+CASCADE_PORTS="${CASCADE_PORTS[*]}"
+CASCADE_LOG="${CASCADE_LOG}"
+CASCADE_CONNECT_TIMEOUT="${CASCADE_CONNECT_TIMEOUT}"
+CASCADE_PROXY_BUFFER="${CASCADE_PROXY_BUFFER}"
+CASCADE_ABSENT_LIMIT=${CASCADE_ABSENT_LIMIT}
+CASCADE_STREAM_CONF="${CASCADE_STREAM_CONF}"
+CASCADE_EXITS_FILE="${CASCADE_EXITS_FILE}"
+CASCADE_STATE_FILE="${CASCADE_STATE_FILE}"
+EOF
 
-    {
-        echo "# Сгенерировано remnanode-scripts.sh (каскад). Ручные правки будут перезаписаны"
-        echo "stream {"
-        echo "    resolver ${resolvers}valid=30s ipv6=off;"
-        echo "    resolver_timeout 3s;"
-        echo
-        echo "    log_format cascade '\$remote_addr [\$time_local] port=\$server_port sni=\$ssl_preread_server_name '"
-        echo "                       'up=\$upstream_addr st=\$status in=\$bytes_received out=\$bytes_sent t=\$session_time';"
-        echo "    access_log ${CASCADE_LOG} cascade buffer=64k flush=5s;"
-        for port in "${CASCADE_PORTS[@]}"; do
-            echo
-            echo "    map \$ssl_preread_server_name \$cascade_exit_${port} {"
-            for d in "${CASCADE_EXITS[@]}"; do
-                echo "        ${d} ${d}:${port};"
+    cat > "$CASCADE_REFRESH_BIN" << 'EOF'
+#!/bin/bash
+# Сгенерировано remnanode-scripts.sh (пункт 8). Узнаёт IP выходов каскада и обновляет конфиг nginx.
+# При сбое DNS оставляет прежние адреса; выход без A-записи исключается только после
+# CASCADE_ABSENT_LIMIT проверок подряд. Журнал: journalctl -u cascade-refresh
+#   cascade-refresh              — обновить, при изменении адресов проверить конфиг и сделать reload
+#   cascade-refresh --no-reload  — только записать конфиг (первичная установка)
+set -u
+source /etc/nginx/cascade.env
+
+lookup() {
+    local out status ips
+    out=$(dig +time=2 +tries=2 +noall +comments +answer "$1" A 2>/dev/null)
+    status=$(grep -oP 'status: \K\w+' <<< "$out" | head -1)
+    ips=$(awk '$4 == "A" { print $5 }' <<< "$out" | sort -u | tr '\n' ' ')
+    if [[ "$status" == NOERROR && -n "$ips" ]]; then echo "ok $ips"
+    elif [[ "$status" == NXDOMAIN || "$status" == NOERROR ]]; then echo "absent"
+    else echo "failed"; fi
+}
+
+declare -A last misses cur
+if [[ -f "$CASCADE_STATE_FILE" ]]; then
+    while read -r d m ips; do misses[$d]=$m; last[$d]=$ips; done < "$CASCADE_STATE_FILE"
+fi
+local_ips=" $(hostname -I 2>/dev/null) "
+state=""
+
+for d in $(cat "$CASCADE_EXITS_FILE"); do
+    read -r res ips <<< "$(lookup "$d")"
+    m=${misses[$d]:-0}
+    case "$res" in
+        ok)
+            for ip in $ips; do
+                if [[ "$local_ips" == *" $ip "* ]]; then
+                    echo "$d указывает на этот сервер ($ip) — петля, выход пропущен" >&2
+                    ips=""
+                fi
             done
-            echo "        default 127.0.0.1:9;    # неизвестный SNI: соединение сбрасывается"
-            echo "    }"
+            [[ -n "$ips" ]] && cur[$d]=$ips
+            m=0
+            ;;
+        absent)
+            m=$(( m + 1 ))
+            if [[ -n "${last[$d]:-}" && $m -lt $CASCADE_ABSENT_LIMIT ]]; then
+                cur[$d]=${last[$d]}
+                echo "$d: нет A-записи (${m}/${CASCADE_ABSENT_LIMIT}), пока оставляю ${last[$d]}" >&2
+            elif [[ -n "${last[$d]:-}" || $m -eq 1 ]]; then
+                echo "$d: нет A-записи — выход исключён" >&2
+            fi
+            ;;
+        failed)
+            if [[ -n "${last[$d]:-}" ]]; then
+                cur[$d]=${last[$d]}
+                echo "$d: DNS не ответил, оставляю ${last[$d]}" >&2
+            else
+                echo "$d: DNS не ответил, адресов ещё нет — выход пропущен" >&2
+            fi
+            ;;
+    esac
+    state+="$d $m ${cur[$d]:-}"$'\n'
+done
+
+upstream_name() { echo "cascade_$(tr -c 'a-zA-Z0-9' '_' <<< "$1" | sed 's/_*$//')_$2"; }
+
+tmp=$(mktemp "${CASCADE_STREAM_CONF}.XXXX")
+{
+    echo "# Сгенерировано cascade-refresh. Ручные правки будут перезаписаны"
+    echo "stream {"
+    echo "    log_format cascade '\$remote_addr [\$time_local] port=\$server_port sni=\$ssl_preread_server_name '"
+    echo "                       'up=\$upstream_addr st=\$status in=\$bytes_received out=\$bytes_sent t=\$session_time';"
+    echo "    access_log ${CASCADE_LOG} cascade buffer=64k flush=5s;"
+    for port in $CASCADE_PORTS; do
+        for d in $(cat "$CASCADE_EXITS_FILE"); do
+            [[ -n "${cur[$d]:-}" ]] || continue
             echo
-            echo "    server {"
-            echo "        listen ${port} reuseport;"
-            echo "        ssl_preread on;"
-            echo "        proxy_pass \$cascade_exit_${port};"
-            echo "        proxy_connect_timeout ${CASCADE_CONNECT_TIMEOUT};"
-            echo "        proxy_next_upstream on;    # нода группы не отвечает — пробуем следующую A-запись"
-            echo "        proxy_timeout 30m;"
-            echo "        proxy_socket_keepalive on;"
-            echo "        proxy_buffer_size ${CASCADE_PROXY_BUFFER};"
+            echo "    upstream $(upstream_name "$d" "$port") {"
+            for ip in ${cur[$d]}; do echo "        server ${ip}:${port};"; done
             echo "    }"
         done
-        echo "}"
-    } > "$CASCADE_STREAM_CONF"
+        echo
+        echo "    map \$ssl_preread_server_name \$cascade_exit_${port} {"
+        for d in $(cat "$CASCADE_EXITS_FILE"); do
+            [[ -n "${cur[$d]:-}" ]] && echo "        ${d} $(upstream_name "$d" "$port");"
+        done
+        echo "        default 127.0.0.1:9;    # неизвестный SNI: соединение сбрасывается"
+        echo "    }"
+        echo
+        echo "    server {"
+        echo "        listen ${port} reuseport;"
+        echo "        ssl_preread on;"
+        echo "        proxy_pass \$cascade_exit_${port};"
+        echo "        proxy_connect_timeout ${CASCADE_CONNECT_TIMEOUT};"
+        echo "        proxy_next_upstream on;    # нода группы не отвечает — пробуем следующую"
+        echo "        proxy_timeout 30m;"
+        echo "        proxy_socket_keepalive on;"
+        echo "        proxy_buffer_size ${CASCADE_PROXY_BUFFER};"
+        echo "    }"
+    done
+    echo "}"
+} > "$tmp"
+chmod 644 "$tmp"
+printf '%s' "$state" > "$CASCADE_STATE_FILE"
+
+if cmp -s "$tmp" "$CASCADE_STREAM_CONF"; then
+    rm -f "$tmp"
+    exit 0
+fi
+if [[ "${1:-}" == --no-reload ]]; then
+    mv "$tmp" "$CASCADE_STREAM_CONF"
+    exit 0
+fi
+
+bak=$(mktemp "${CASCADE_STREAM_CONF}.bak.XXXX")
+cp -p "$CASCADE_STREAM_CONF" "$bak" 2>/dev/null || true
+mv "$tmp" "$CASCADE_STREAM_CONF"
+if nginx -t -q 2>/dev/null; then
+    systemctl reload nginx
+    echo "адреса выходов изменились, nginx перезагружен" >&2
+    rm -f "$bak"
+else
+    mv "$bak" "$CASCADE_STREAM_CONF"
+    echo "новый конфиг невалиден, оставлен прежний" >&2
+    exit 1
+fi
+EOF
+    chmod 755 "$CASCADE_REFRESH_BIN"
+
+    cat > "/etc/systemd/system/${CASCADE_REFRESH_UNIT}.service" << EOF
+[Unit]
+Description=Обновление IP выходов каскада в nginx
+After=network-online.target nginx.service
+
+[Service]
+Type=oneshot
+ExecStart=${CASCADE_REFRESH_BIN}
+EOF
+    cat > "/etc/systemd/system/${CASCADE_REFRESH_UNIT}.timer" << EOF
+[Unit]
+Description=Обновление IP выходов каскада раз в минуту
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload
 }
 
 # Лимиты от размера сервера: память на сессии делится между воркерами (воркер = ядро).
@@ -879,17 +1022,24 @@ EOF
     log_info "Logrotate для каскада настроен"
 }
 
-# Резолвит выходы; несколько A-записей у одного имени — группа нод одного профиля
+# Резолвит выходы; несколько A-записей у одного имени — группа нод одного профиля.
+# Имена без A-записи исключаются из списка, при сбое DNS выход остаётся (адрес подставит таймер)
 resolve_cascade_exits() {
-    local d ips ip local_ips
+    local d res ips ip local_ips kept=()
     local_ips=" ${SERVER_IP} $(hostname -I 2>/dev/null) "
 
     declare -gA CASCADE_EXIT_IPS=()
     for d in "${CASCADE_EXITS[@]}"; do
-        ips=$(getent ahostsv4 "$d" | awk '!seen[$1]++ { print $1 }' | tr '\n' ' ' | sed 's/ *$//')
+        read -r res ips <<< "$(cascade_lookup "$d")"
+        ips="${ips% }"
+        if [[ "$res" == absent ]]; then
+            log_warn "$d: нет A-записи — выход исключён из списка"
+            continue
+        fi
+        kept+=("$d")
         CASCADE_EXIT_IPS[$d]="$ips"
-        if [[ -z "$ips" ]]; then
-            log_warn "$d не резолвится — путь через него работать не будет, пока нет A-записи"
+        if [[ "$res" == failed ]]; then
+            log_warn "$d: DNS не ответил — выход оставлен, адрес подставится при следующей проверке"
             continue
         fi
         for ip in $ips; do
@@ -897,11 +1047,14 @@ resolve_cascade_exits() {
                 && log_error "$d указывает на этот сервер ($ip) — получится петля. Имя выхода должно указывать на выход, не на вход"
         done
         if [[ "$ips" == *" "* ]]; then
-            log_info "$d → $ips (группа нод, DNS-балансировка по кругу)"
+            log_info "$d → $ips (группа нод, балансировка по кругу)"
         else
             log_info "$d → $ips"
         fi
     done
+
+    (( ${#kept[@]} > 0 )) || log_error "Ни у одного выхода нет A-записи — нечего настраивать"
+    CASCADE_EXITS=("${kept[@]}")
 }
 
 setup_cascade() {
@@ -910,10 +1063,10 @@ setup_cascade() {
     read_cascade_exits
     check_cascade_ports
 
-    if ! command -v nginx >/dev/null || ! dpkg -s libnginx-mod-stream >/dev/null 2>&1; then
-        log_info "Установка nginx и модуля stream..."
+    if ! command -v nginx >/dev/null || ! dpkg -s libnginx-mod-stream >/dev/null 2>&1 || ! command -v dig >/dev/null; then
+        log_info "Установка nginx, модуля stream и dig..."
         apt update -q
-        apt install -y -q nginx libnginx-mod-stream
+        apt install -y -q nginx libnginx-mod-stream dnsutils
     fi
     nginx -V 2>&1 | grep -q ssl_preread || log_error "nginx собран без ssl_preread, установите nginx из репозитория nginx.org"
 
@@ -938,8 +1091,10 @@ setup_cascade() {
 
     mkdir -p "$CASCADE_LOG_DIR"
     cascade_compute_limits
+    printf '%s\n' "${CASCADE_EXITS[@]}" > "$CASCADE_EXITS_FILE"
+    install_cascade_refresh
     log_info "Запись $CASCADE_STREAM_CONF..."
-    write_cascade_conf
+    "$CASCADE_REFRESH_BIN" --no-reload
     patch_nginx_conf
 
     if ! nginx -t; then
@@ -951,7 +1106,8 @@ setup_cascade() {
 
     systemctl enable nginx >/dev/null 2>&1 || true
     systemctl reload-or-restart nginx
-    printf '%s\n' "${CASCADE_EXITS[@]}" > "$CASCADE_EXITS_FILE"
+    systemctl enable --now "${CASCADE_REFRESH_UNIT}.timer" >/dev/null 2>&1 \
+        || log_warn "Не удалось включить ${CASCADE_REFRESH_UNIT}.timer — IP выходов не будут обновляться автоматически"
 
     setup_cascade_logrotate
 
@@ -978,6 +1134,7 @@ setup_cascade() {
     echo -e "  Порты:     ${YELLOW}${CASCADE_PORTS[*]}${NC}"
     echo -e "  Выходы:    ${YELLOW}${CASCADE_EXITS[*]}${NC}"
     echo -e "  Журнал:    ${YELLOW}tail -f ${CASCADE_LOG}${NC}"
+    echo -e "  IP выходов: ${YELLOW}обновляются раз в минуту, журнал: journalctl -u ${CASCADE_REFRESH_UNIT}${NC}"
     echo -e "  Хостов в панели: ${YELLOW}$(( ${#CASCADE_EXITS[@]} * ${#CASCADE_PORTS[@]} ))${NC} (выход × порт): address = ${CASCADE_ENTRY}, sni = домен выхода,"
     echo -e "  inbound профиля выхода, overrideSniFromAddress выключен"
     echo -e "${GREEN}════════════════════════════════════════${NC}"
