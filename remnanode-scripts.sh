@@ -37,10 +37,15 @@ CASCADE_EXITS_FILE="/etc/nginx/cascade-exits.list"
 CASCADE_ENTRY_FILE="/etc/nginx/cascade-entry.domain"
 CASCADE_DEFAULT_PORTS="443 8443"
 CASCADE_CONNECT_TIMEOUT="4s"
-# Сессия stream занимает 2 соединения (клиент + выход): 16384 ≈ 8192 сессий на воркер (ядро).
-# При исчерпании лимита новые соединения не принимаются у всех пользователей входа
-CASCADE_WORKER_CONNECTIONS=16384
+# Лимиты входа считаются от размера сервера (cascade_compute_limits).
+# Сессия stream занимает 2 соединения (клиент + выход); при исчерпании worker_connections
+# новые соединения не принимаются у всех пользователей входа
+CASCADE_MIN_WORKER_CONNECTIONS=16384
+CASCADE_MAX_WORKER_CONNECTIONS=64000      # с запасом под worker_rlimit_nofile 65535
 CASCADE_RLIMIT_NOFILE=65535
+CASCADE_RAM_RESERVE_MB=512                # системе, nginx и прочему, не под сессии
+CASCADE_SESSION_KB=64                     # память на сессию: буферы nginx 2×8k + сокеты ядра, с запасом
+CASCADE_PORTS_SYSCTL_CONF="/etc/sysctl.d/92-cascade.conf"
 # Буфер на каждое направление сессии (по умолчанию 16k): вдвое меньше памяти на сессию
 CASCADE_PROXY_BUFFER="8k"
 NGINX_ERROR_LOG="/var/log/nginx/error.log"
@@ -504,8 +509,9 @@ cleanup_disk() {
 # ufw отслеживает каждое соединение. При заполнении таблицы ядро молча отбрасывает новые
 # соединения (dmesg: "nf_conntrack: table full"). По умолчанию пропавшее соединение живёт
 # в таблице 5 суток, а TIME_WAIT — 2 минуты, поэтому на прокси таблица забивается за часы
+# Необязательный аргумент — желаемый лимит (по умолчанию CONNTRACK_MAX); текущий больший не уменьшается
 tune_conntrack() {
-    local current max
+    local current max want="${1:-$CONNTRACK_MAX}"
 
     modprobe nf_conntrack 2>/dev/null || true
     current=$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || true)
@@ -513,7 +519,7 @@ tune_conntrack() {
         log_info "conntrack не используется, пропускаю настройку"
         return
     fi
-    max=$(( current > CONNTRACK_MAX ? current : CONNTRACK_MAX ))
+    max=$(( current > want ? current : want ))
 
     log_info "Настройка conntrack: лимит ${current} → ${max}, укороченные таймауты..."
     # Модуль грузится до применения sysctl.d, иначе после перезагрузки настройки не применятся
@@ -739,6 +745,45 @@ write_cascade_conf() {
     } > "$CASCADE_STREAM_CONF"
 }
 
+# Лимиты от размера сервера: память на сессии делится между воркерами (воркер = ядро).
+# Задаёт CASCADE_WORKER_CONNECTIONS и CASCADE_CONNTRACK_MAX
+cascade_compute_limits() {
+    local ram_mb cores total per_worker current ct ct_cap
+
+    ram_mb=$(awk '/^MemTotal:/ { print int($2 / 1024) }' /proc/meminfo)
+    cores=$(nproc 2>/dev/null || echo 1)
+
+    total=$(( (ram_mb - CASCADE_RAM_RESERVE_MB) * 1024 / CASCADE_SESSION_KB * 2 ))
+    per_worker=$(( total > 0 ? total / cores : 0 ))
+    (( per_worker < CASCADE_MIN_WORKER_CONNECTIONS )) && per_worker=$CASCADE_MIN_WORKER_CONNECTIONS
+    (( per_worker > CASCADE_MAX_WORKER_CONNECTIONS )) && per_worker=$CASCADE_MAX_WORKER_CONNECTIONS
+
+    # Поднятое вручную значение не уменьшаем
+    current=$(sed -n -E 's/^[[:space:]]*worker_connections[[:space:]]+([0-9]+);.*/\1/p' "$NGINX_CONF" | head -1)
+    (( ${current:-0} > per_worker && current <= CASCADE_MAX_WORKER_CONNECTIONS )) && per_worker=$current
+    CASCADE_WORKER_CONNECTIONS=$per_worker
+
+    # Запись conntrack на каждое соединение плюс закрытые (TIME_WAIT); не больше ~8% памяти (≈320 байт на запись)
+    ct=$(( per_worker * cores * 2 ))
+    ct_cap=$(( ram_mb * 256 ))
+    (( ct > ct_cap )) && ct=$ct_cap
+    (( ct < CONNTRACK_MAX )) && ct=$CONNTRACK_MAX
+    CASCADE_CONNTRACK_MAX=$ct
+
+    log_info "Сервер: ${cores} ядер, ${ram_mb} МБ → worker_connections ${per_worker} на ядро (~$(( per_worker / 2 * cores )) сессий), conntrack ${ct}"
+}
+
+# Исходящих портов к одному IP:порту выхода по умолчанию ~28 тыс. (32768–60999) — расширяем до ~55 тыс.
+# tcp_tw_reuse=1 позволяет повторно брать порты исходящих соединений из TIME_WAIT
+setup_cascade_sysctl() {
+    cat > "$CASCADE_PORTS_SYSCTL_CONF" << EOF
+net.ipv4.ip_local_port_range = 10000 65535
+net.ipv4.tcp_tw_reuse = 1
+EOF
+    chmod 644 "$CASCADE_PORTS_SYSCTL_CONF"
+    sysctl -q -p "$CASCADE_PORTS_SYSCTL_CONF" || log_warn "sysctl $CASCADE_PORTS_SYSCTL_CONF применился не полностью"
+}
+
 # Подключает stream-конфиг в nginx.conf и поднимает лимиты соединений
 patch_nginx_conf() {
     if ! grep -q "include ${CASCADE_STREAM_CONF};" "$NGINX_CONF"; then
@@ -751,6 +796,8 @@ patch_nginx_conf() {
     elif (( nofile < CASCADE_RLIMIT_NOFILE )); then
         sed -i -E "s/^([[:space:]]*worker_rlimit_nofile)[[:space:]]+[0-9]+;/\1 ${CASCADE_RLIMIT_NOFILE};/" "$NGINX_CONF"
     fi
+    # Один воркер на ядро: лимит соединений растёт вместе с ядрами
+    sed -i -E 's/^([[:space:]]*worker_processes)[[:space:]]+[0-9]+;/\1 auto;/' "$NGINX_CONF"
     sed -i -E "s/^([[:space:]]*worker_connections)[[:space:]]+[0-9]+;/\1 ${CASCADE_WORKER_CONNECTIONS};/" "$NGINX_CONF"
 }
 
@@ -890,6 +937,7 @@ setup_cascade() {
     fi
 
     mkdir -p "$CASCADE_LOG_DIR"
+    cascade_compute_limits
     log_info "Запись $CASCADE_STREAM_CONF..."
     write_cascade_conf
     patch_nginx_conf
@@ -916,7 +964,8 @@ setup_cascade() {
         log_info "Включение ufw..."
         ufw --force enable
     fi
-    tune_conntrack
+    tune_conntrack "$CASCADE_CONNTRACK_MAX"
+    setup_cascade_sysctl
 
     check_cascade_exits
     check_cascade_capacity
