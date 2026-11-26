@@ -62,6 +62,9 @@ CASCADE_PORTS_SYSCTL_CONF="/etc/sysctl.d/92-cascade.conf"
 CASCADE_PROXY_BUFFER="8k"
 # Очередь ещё не принятых подключений на каждый воркер (reuseport); по умолчанию в nginx 511
 CASCADE_LISTEN_BACKLOG=4096
+# UDP-пересылка Hysteria2 по умолчанию: UDP 443 до входа режется, поэтому отдельный порт
+CASCADE_UDP_DEFAULT_PORT=4443
+CASCADE_UDP_DEFAULT_DOMAIN="sub.example.com"
 NGINX_ERROR_LOG="/var/log/nginx/error.log"
 # Отдельная папка: /var/log/nginx/*.log уже ротирует пакет nginx, второй конфиг дал бы duplicate log entry
 CASCADE_LOG_DIR="/var/log/cascade"
@@ -828,7 +831,7 @@ read_cascade_exits() {
     saved=""
     [[ -f "$CASCADE_EXITS_FILE" ]] && saved=$(tr '\n' ' ' < "$CASCADE_EXITS_FILE" | sed 's/ *$//')
 
-    echo "Домены выходов через запятую или пробел (например kraw-pl-1.example.com,kraw-pl-2.example.com)"
+    echo "Домены выходов через запятую или пробел (например sub-1.example.com,sub-2.example.com)"
     read -rp "Выходы${saved:+ [$saved]}: " input
     input="${input:-$saved}"
     [[ -z "$input" ]] && log_error "Список выходов не может быть пустым"
@@ -851,28 +854,74 @@ read_cascade_exits() {
     read_cascade_udp_map
 }
 
-# Необязательная UDP-пересылка (Hysteria2): пары "порт:домен" → upstream домена на порт 443.
-# Значение хранится в cascade.env и предлагается при повторном запуске; "-" — отключить
+# UDP-пересылка (Hysteria2): пары "порт:домен[,порт:домен]" → upstream домена на порт 443.
+# UDP 443 до входа часто режется, поэтому по умолчанию отдельный порт. При установке
+# спрашивается; если CASCADE_UDP_MAP уже есть в cascade.env, значение не перезаписывается
+# (правится в файле, пустое значение — UDP выключен)
 read_cascade_udp_map() {
-    local saved input pair uport ud pairs=()
-    saved=$(sed -n 's/^CASCADE_UDP_MAP="\(.*\)"$/\1/p' "$CASCADE_ENV_FILE" 2>/dev/null)
+    local line uport ud
 
-    echo "UDP-пересылка (Hysteria2): пары порт:домен через пробел, например 44301:kraw-pl.example.com"
-    read -rp "UDP-пары (Enter — ${saved:-нет}, '-' — отключить): " input
-    [[ "$input" == "-" ]] && { CASCADE_UDP_MAP=""; return; }
-    input="${input:-$saved}"
+    line=$(grep -m1 '^CASCADE_UDP_MAP=' "$CASCADE_ENV_FILE" 2>/dev/null || true)
+    if [[ -n "$line" ]]; then
+        CASCADE_UDP_MAP=$(sed -n 's/^CASCADE_UDP_MAP="\(.*\)"$/\1/p' <<< "$line")
+        log_info "UDP-карта из $CASCADE_ENV_FILE: ${CASCADE_UDP_MAP:-пусто, UDP выключен} (не перезаписываю, правится в файле)"
+    else
+        echo "UDP-пересылка Hysteria2: UDP 443 до входа часто режется, поэтому нужен отдельный порт"
+        read -rp "UDP-порт [${CASCADE_UDP_DEFAULT_PORT}] ('-' — без UDP): " uport
+        if [[ "$uport" == "-" ]]; then
+            CASCADE_UDP_MAP=""
+            return
+        fi
+        read -rp "Выход для UDP [${CASCADE_UDP_DEFAULT_DOMAIN}]: " ud
+        CASCADE_UDP_MAP="${uport:-$CASCADE_UDP_DEFAULT_PORT}:${ud:-$CASCADE_UDP_DEFAULT_DOMAIN}"
+    fi
 
-    for pair in $(tr ',;' '  ' <<< "$input" | tr '[:upper:]' '[:lower:]'); do
+    check_cascade_udp_map
+}
+
+# Проверяет и нормализует CASCADE_UDP_MAP (через запятую, нижний регистр)
+check_cascade_udp_map() {
+    local pair uport ud users pairs=() ports=" "
+
+    for pair in $(tr ',;' '  ' <<< "$CASCADE_UDP_MAP" | tr '[:upper:]' '[:lower:]'); do
         uport="${pair%%:*}" ud="${pair#*:}"
-        [[ "$pair" == *:* && "$uport" =~ ^[0-9]+$ && "$uport" -ge 1 && "$uport" -le 65535 ]] \
-            || log_error "Некорректная UDP-пара: $pair (нужно порт:домен)"
+        [[ "$pair" == *:* && "$uport" =~ ^[0-9]+$ ]] && (( uport >= 1 && uport <= 65535 )) \
+            || log_error "Некорректная UDP-пара: $pair (нужно порт:домен, порт 1–65535)"
         [[ "$ud" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]] \
             || log_error "Некорректный домен в UDP-паре: $pair"
+        [[ "$ports" == *" $uport "* ]] && log_error "UDP-порт $uport повторяется в карте: $CASCADE_UDP_MAP"
+        ports+="$uport "
+
+        users=$(ss -Hulnp "sport = :${uport}" 2>/dev/null | grep -o 'users:(("[^"]*"' | cut -d'"' -f2 | sort -u | tr '\n' ' ')
+        [[ -n "$users" && "$users" != "nginx " ]] && log_error "UDP-порт $uport занят: ${users}— выберите другой"
+
+        (( uport == 443 )) && log_warn "$pair: UDP 443 часто режется по пути до входа, рекомендуется ${CASCADE_UDP_DEFAULT_PORT}"
         [[ " ${CASCADE_EXITS[*]} " == *" $ud "* && " ${CASCADE_PORTS[*]} " == *" 443 "* ]] \
-            || log_warn "$pair: UDP использует upstream ${ud} на порт 443 — нужен этот выход в списке и порт 443, иначе пара будет пропущена"
+            || log_warn "$pair: нужен выход $ud в списке и TCP-порт 443 (общий upstream), иначе пара будет пропущена"
         pairs+=("${uport}:${ud}")
     done
-    CASCADE_UDP_MAP="${pairs[*]}"
+
+    CASCADE_UDP_MAP=$(IFS=,; echo "${pairs[*]}")
+}
+
+# ufw: открывает UDP-порты карты, а правила cascade-udp для портов не из карты удаляет
+# (с конца списка, чтобы номера правил не съезжали)
+sync_cascade_udp_ufw() {
+    local pair num port keep=" "
+
+    for pair in $(tr ',' ' ' <<< "${CASCADE_UDP_MAP:-}"); do
+        keep+="${pair%%:*} "
+        log_info "UFW: открываю ${pair%%:*}/udp (${pair#*:})"
+        ufw allow "${pair%%:*}/udp" comment 'cascade-udp' >/dev/null
+    done
+
+    ufw status numbered 2>/dev/null \
+        | sed -nE 's/^\[ *([0-9]+)\] ([0-9]+)\/udp.*# cascade-udp[[:space:]]*$/\1 \2/p' \
+        | sort -rn | while read -r num port; do
+            [[ "$keep" == *" $port "* ]] && continue
+            log_info "UFW: удаляю устаревшее правило ${port}/udp (cascade-udp)"
+            ufw --force delete "$num" >/dev/null
+        done
 }
 
 # Порт должен быть свободен или занят самим nginx (повторный запуск)
@@ -914,7 +963,8 @@ CASCADE_ABSENT_LIMIT=${CASCADE_ABSENT_LIMIT}
 CASCADE_STREAM_CONF="${CASCADE_STREAM_CONF}"
 CASCADE_EXITS_FILE="${CASCADE_EXITS_FILE}"
 CASCADE_STATE_FILE="${CASCADE_STATE_FILE}"
-# Необязательно: UDP-порты (Hysteria2) → upstream домена на порт 443, пары "порт:домен" через пробел
+# UDP-порты (Hysteria2) → upstream домена на порт 443: "порт:домен[,порт:домен]"; пусто — UDP выключен.
+# Пункт 8 это значение не перезаписывает
 CASCADE_UDP_MAP="${CASCADE_UDP_MAP:-}"
 EOF
 
@@ -997,9 +1047,11 @@ tmp=$(mktemp "${CASCADE_STREAM_CONF}.XXXX")
             [[ -n "${cur[$d]:-}" ]] || continue
             echo
             echo "    upstream $(upstream_name "$d" "$port") {"
-            # Клиент держится одной ноды группы (стабильный внешний IP); при смене состава
-            # нод переезжает только часть клиентов. Одна и та же нода для TCP и UDP
-            echo "        hash \$remote_addr consistent;"
+            # Клиент держится одной ноды группы (стабильный внешний IP). Без consistent:
+            # кольцо ketama строится из адресов вместе с портом, и TCP/gRPC/UDP одного клиента
+            # ушли бы на разные ноды. Обычный hash выбирает по номеру в списке — списки IP
+            # для всех портов домена одинаковые и в одном порядке (sort -u -V)
+            echo "        hash \$remote_addr;"
             for ip in $(tr ' ' '\n' <<< "${cur[$d]}" | sort -u -V); do
                 echo "        server ${ip}:${port} max_fails=2 fail_timeout=15s;"
             done
@@ -1025,17 +1077,29 @@ tmp=$(mktemp "${CASCADE_STREAM_CONF}.XXXX")
         echo "    }"
     done
 
-    # UDP (Hysteria2): тот же upstream домена на порт 443 — SNI в QUIC не прочитать, выход задаёт порт
-    for pair in ${CASCADE_UDP_MAP:-}; do
+    # UDP (Hysteria2): тот же upstream домена на порт 443 — SNI в QUIC не прочитать, выход задаёт порт.
+    # Неверная пара пропускается с предупреждением, а не роняет nginx
+    udp_ports=" "
+    for pair in $(tr ',' ' ' <<< "${CASCADE_UDP_MAP:-}"); do
         uport="${pair%%:*}" ud="${pair#*:}"
-        if [[ "$pair" != *:* || ! "$uport" =~ ^[0-9]+$ ]]; then
+        if [[ "$pair" != *:* || ! "$uport" =~ ^[0-9]+$ ]] || (( uport < 1 || uport > 65535 )); then
             echo "CASCADE_UDP_MAP: неверная пара '$pair' — пропущена" >&2
+            continue
+        fi
+        if [[ "$udp_ports" == *" $uport "* ]]; then
+            echo "CASCADE_UDP_MAP: UDP-порт $uport повторяется — пара '$pair' пропущена" >&2
+            continue
+        fi
+        users=$(ss -Hulnp "sport = :${uport}" 2>/dev/null | grep -o 'users:(("[^"]*"' | cut -d'"' -f2 | sort -u | tr '\n' ' ')
+        if [[ -n "$users" && "$users" != "nginx " ]]; then
+            echo "CASCADE_UDP_MAP: UDP-порт $uport занят (${users% }) — пара '$pair' пропущена" >&2
             continue
         fi
         if [[ " $CASCADE_PORTS " != *" 443 "* || -z "${cur[$ud]:-}" ]]; then
             echo "CASCADE_UDP_MAP: нет upstream $(upstream_name "$ud" 443) — UDP-порт $uport пропущен" >&2
             continue
         fi
+        udp_ports+="$uport "
         echo
         echo "    server {"
         echo "        listen ${uport} udp reuseport;"
@@ -1047,6 +1111,14 @@ tmp=$(mktemp "${CASCADE_STREAM_CONF}.XXXX")
 } > "$tmp"
 chmod 644 "$tmp"
 printf '%s' "$state" > "$CASCADE_STATE_FILE"
+
+# hash без consistent даёт одну ноду на все порты только при одинаковых списках IP
+awk '/^    upstream cascade_/ { name = $2; sub(/_[0-9]+$/, "", name); list = ""; inside = 1; next }
+     inside && /^        server / { split($2, a, ":"); list = list a[1] " "; next }
+     inside && /^    }/ { if (name in ref && ref[name] != list) print name; else ref[name] = list; inside = 0 }' "$tmp" \
+    | sort -u | while read -r name; do
+        echo "${name}: списки IP отличаются между портами — TCP/UDP одного клиента могут уйти на разные ноды" >&2
+    done
 
 if cmp -s "$tmp" "$CASCADE_STREAM_CONF"; then
     rm -f "$tmp"
@@ -1335,10 +1407,7 @@ setup_cascade() {
         log_info "UFW: открываю ${port}/tcp"
         ufw allow "${port}/tcp" comment 'cascade' >/dev/null
     done
-    for port in ${CASCADE_UDP_MAP:-}; do
-        log_info "UFW: открываю ${port%%:*}/udp (${port#*:})"
-        ufw allow "${port%%:*}/udp" comment 'cascade-udp' >/dev/null
-    done
+    sync_cascade_udp_ufw
     if ! ufw status | grep -q '^Status: active'; then
         log_info "Включение ufw..."
         ufw --force enable
@@ -1362,6 +1431,18 @@ setup_cascade() {
     echo -e "  Хостов в панели: ${YELLOW}$(( ${#CASCADE_EXITS[@]} * ${#CASCADE_PORTS[@]} ))${NC} (выход × порт): address = ${CASCADE_ENTRY}, sni = домен выхода,"
     echo -e "  inbound профиля выхода, overrideSniFromAddress выключен"
     echo -e "${GREEN}════════════════════════════════════════${NC}"
+
+    if [[ -n "${CASCADE_UDP_MAP:-}" ]]; then
+        echo
+        log_info "UDP-сокеты nginx:"
+        ss -ulnp | grep nginx || log_warn "nginx не слушает UDP — проверьте journalctl -u ${CASCADE_REFRESH_UNIT}"
+        log_info "UDP-listen в конфигурации nginx:"
+        nginx -T 2>/dev/null | grep -E '^\s*listen .* udp'
+        log_info "Проверка с клиента (на входе смотреть: tcpdump -ni any udp port <порт>):"
+        for port in $(tr ',' ' ' <<< "$CASCADE_UDP_MAP"); do
+            echo "  echo test | nc -u -w1 ${SERVER_IP} ${port%%:*}"
+        done
+    fi
 }
 
 # ─── Сценарии ─────────────────────────────────────────────────────────────────
