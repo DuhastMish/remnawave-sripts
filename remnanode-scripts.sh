@@ -1052,8 +1052,10 @@ tmp=$(mktemp "${CASCADE_STREAM_CONF}.XXXX")
             # ушли бы на разные ноды. Обычный hash выбирает по номеру в списке — списки IP
             # для всех портов домена одинаковые и в одном порядке (sort -u -V)
             echo "        hash \$remote_addr;"
+            # Мягкое исключение: нода выпадает из пула только после 5 неудач за 5 с и всего на 5 с —
+            # единичные сбои пути (ТСПУ, потери) не перекидывают клиентов на другие ноды
             for ip in $(tr ' ' '\n' <<< "${cur[$d]}" | sort -u -V); do
-                echo "        server ${ip}:${port} max_fails=2 fail_timeout=15s;"
+                echo "        server ${ip}:${port} max_fails=5 fail_timeout=5s;"
             done
             echo "    }"
         done
